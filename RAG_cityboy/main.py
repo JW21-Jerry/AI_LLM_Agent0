@@ -37,9 +37,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 # Supabase 클라이언트 및 구글 임베딩 모델(768차원) 초기화
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/text-embedding-004", 
+    model="models/embedding-001", 
     google_api_key=GOOGLE_API_KEY
-)
+)))
 
 # LLM 객체 초기화 (gemini-3.5-flash-lite 적용)
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", google_api_key=GOOGLE_API_KEY, temperature=0.3)
