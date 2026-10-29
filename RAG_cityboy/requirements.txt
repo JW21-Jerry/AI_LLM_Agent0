@@ -8,3 +8,4 @@ langchain-community
 supabase
 pypdf
 sse-starlette
+google-generativeai
