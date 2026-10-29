@@ -8,8 +8,8 @@ from typing import List, Dict
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+# OpenAI 대신 구글 임베딩 모델 사용
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client, Client
 
@@ -17,25 +17,29 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage, AIMessage
 
-# FastAPI 앱 생성 및 CORS 설정
+# FastAPI 앱 생성
 app = FastAPI()
+
+# CORS 에러 완벽 차단 설정 (allow_credentials=False 가 핵심)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False, # <-- False로 수정
+    allow_credentials=False, 
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 환경 변수 로드 (Cloud Run 환경 변수에 등록 필요)
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") # 구글 AI API 키
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") # 오픈 AI API 키 (임베딩용)
+# 환경 변수 로드 (OpenAI_API_KEY 삭제됨)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Supabase 클라이언트 및 임베딩 모델(OpenAI) 초기화
+# Supabase 클라이언트 및 구글 임베딩 모델(768차원) 초기화
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="models/text-embedding-004", 
+    google_api_key=GOOGLE_API_KEY
+)
 
 # LLM 객체 초기화 (gemini-3.5-flash-lite 적용)
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", google_api_key=GOOGLE_API_KEY, temperature=0.3)
