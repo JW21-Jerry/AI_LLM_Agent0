@@ -6,9 +6,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict
 
+# 에러 우회를 위한 구글 직통 라이브러리 추가
+import google.generativeai as genai
+from langchain_core.embeddings import Embeddings
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import create_client, Client
 
@@ -32,11 +36,19 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 구글 임베딩 모델 (정상적인 001 버전)
-embeddings = GoogleGenerativeAIEmbeddings(
-    model="models/embedding-001", 
-    google_api_key=GOOGLE_API_KEY
-)
+# ---------------------------------------------------------
+# [수정됨] 404 에러를 우회하는 커스텀 구글 임베딩 클래스 (768차원)
+genai.configure(api_key=GOOGLE_API_KEY)
+
+class DirectGoogleEmbeddings(Embeddings):
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [genai.embed_content(model="models/text-embedding-004", content=t)["embedding"] for t in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        return genai.embed_content(model="models/text-embedding-004", content=text)["embedding"]
+
+embeddings = DirectGoogleEmbeddings()
+# ---------------------------------------------------------
 
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", google_api_key=GOOGLE_API_KEY, temperature=0.3)
 
