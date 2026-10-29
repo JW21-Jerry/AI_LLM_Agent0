@@ -1,12 +1,12 @@
 import os
 import json
+import math
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict
 
-# 에러 우회를 위한 구글 직통 라이브러리 추가
 import google.generativeai as genai
 from langchain_core.embeddings import Embeddings
 
@@ -37,15 +37,26 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------------------------------------------------
-# [수정됨] 404 에러를 우회하는 커스텀 구글 임베딩 클래스 (768차원)
+# [최종 에러 방어] 구글 최신 임베딩 모델(gemini-embedding-001) 강제 적용 및 768차원 정규화 클래스
 genai.configure(api_key=GOOGLE_API_KEY)
+
+def get_768_embedding(text: str) -> List[float]:
+    # 최신 모델 이름(gemini-embedding-001)으로 원본 벡터 추출
+    emb = genai.embed_content(model="models/gemini-embedding-001", content=text)["embedding"]
+    # Supabase 크기에 맞게 768차원으로 자르기
+    emb_768 = emb[:768]
+    # 정확도 유지를 위한 L2 수학적 정규화
+    norm = math.sqrt(sum(x * x for x in emb_768))
+    if norm > 0:
+        emb_768 = [x / norm for x in emb_768]
+    return emb_768
 
 class DirectGoogleEmbeddings(Embeddings):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [genai.embed_content(model="models/text-embedding-004", content=t)["embedding"] for t in texts]
+        return [get_768_embedding(t) for t in texts]
 
     def embed_query(self, text: str) -> List[float]:
-        return genai.embed_content(model="models/text-embedding-004", content=text)["embedding"]
+        return get_768_embedding(text)
 
 embeddings = DirectGoogleEmbeddings()
 # ---------------------------------------------------------
