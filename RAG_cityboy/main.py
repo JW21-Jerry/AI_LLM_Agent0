@@ -32,7 +32,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# 1. 구글 임베딩 모델 (정상적인 001 버전 사용)
+# 구글 임베딩 모델 (정상적인 001 버전)
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/embedding-001", 
     google_api_key=GOOGLE_API_KEY
