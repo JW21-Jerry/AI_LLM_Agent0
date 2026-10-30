@@ -20,7 +20,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 app = FastAPI()
 
-# CORS 에러 방지 (시험용 완벽 설정)
+# CORS 에러 방지
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,7 +31,7 @@ app.add_middleware(
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 
-# [필수] 구글 임베딩 모델 (404 에러 방지용 커스텀 클래스)
+# 구글 임베딩 모델 (404 에러 방지용 커스텀 클래스)
 genai.configure(api_key=GOOGLE_API_KEY)
 class DirectGoogleEmbeddings(Embeddings):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
@@ -59,7 +59,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(documents)
     
-    # [필수] Chroma DB 사용 (클라우드 런 임시 폴더에 저장)
+    # Chroma DB 사용 (클라우드 런 임시 폴더에 저장)
     Chroma.from_documents(
         documents=splits, 
         embedding=embeddings, 
@@ -76,12 +76,12 @@ async def chat_stream(request: ChatRequest):
     # 저장된 Chroma DB 로드
     vectorstore = Chroma(persist_directory="/tmp/chroma_db", embedding_function=embeddings)
     
-    # [필수] 다중 질문 검색기 (MultiQueryRetriever) 적용
+    # 다중 질문 검색기 (MultiQueryRetriever) 적용
     retriever = MultiQueryRetriever.from_llm(
         retriever=vectorstore.as_retriever(), llm=llm
     )
     
-    # [필수] 시스템 역할 정의
+    # 시스템 역할 정의 (교수님 요구사항 반영)
     template = """당신은 도시 계획 설계자입니다. 특히 서울시에 특화된 설계자로 사용자의 질문에 답변하세요.
     아래의 제공된 문서 내용을 바탕으로 답변을 작성하세요.
     
@@ -92,7 +92,7 @@ async def chat_stream(request: ChatRequest):
     """
     prompt = ChatPromptTemplate.from_template(template)
     
-    # [필수] 질의 확장 - RunnablePassthrough 사용 (최신 LCEL 문법)
+    # 질의 확장 - RunnablePassthrough 사용
     rag_chain = (
         {"context": retriever, "question": RunnablePassthrough()}
         | prompt
@@ -101,10 +101,10 @@ async def chat_stream(request: ChatRequest):
     )
 
     async def generate_response():
-        # 메타 데이터(스트리밍 시작 알림)
+        # 메타 데이터 전송
         yield f"data: {json.dumps({'type': 'meta', 'status': 'started'})}\n\n"
         
-        # 실시간 스트리밍 핸들러 (LCEL astream 활용)
+        # 실시간 스트리밍
         async for chunk in rag_chain.astream(request.query):
             yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
             
