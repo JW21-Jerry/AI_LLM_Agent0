@@ -1,115 +1,144 @@
 import os
-import json
-from fastapi import FastAPI, UploadFile, File
+import tempfile
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
 
-import google.generativeai as genai
-from langchain_core.embeddings import Embeddings
-
+# Langchain 및 OpenAI 관련 모듈 (구글 관련 모듈 제거)
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-
-# 에러가 나는 모듈 대신 코어를 직접 사용
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.retrievers.multi_query import MultiQueryRetriever
 from langchain_core.runnables import RunnablePassthrough
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain import hub
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 
+# 앱 초기화
 app = FastAPI()
 
+# [실전 에러 방지 조건 1] CORS 정책 완벽 해결
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False, 
+    allow_origins=["*"], 
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
+# 전역 변수로 Vector DB 저장
+vector_db = None
 
-genai.configure(api_key=GOOGLE_API_KEY)
-class DirectGoogleEmbeddings(Embeddings):
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [genai.embed_content(model="models/text-embedding-004", content=t)["embedding"] for t in texts]
-    def embed_query(self, text: str) -> List[float]:
-        return genai.embed_content(model="models/text-embedding-004", content=text)["embedding"]
+# OpenAI API 키 및 모델 설정
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+EMBEDDING_MODEL = "text-embedding-3-small" # 가성비가 가장 좋은 최신 OpenAI 임베딩
+LLM_MODEL = "gpt-4o-mini" # 빠르고 저렴한 모델
 
-embeddings = DirectGoogleEmbeddings()
-llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", google_api_key=GOOGLE_API_KEY, temperature=0.3)
-
-class ChatRequest(BaseModel):
+class QueryRequest(BaseModel):
     query: str
 
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    file_path = f"/tmp/{file.filename}"
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-        
-    loader = PyPDFLoader(file_path)
-    documents = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    splits = text_splitter.split_documents(documents)
-    
-    Chroma.from_documents(
-        documents=splits, 
-        embedding=embeddings, 
-        persist_directory="/tmp/chroma_db"
-    )
-    os.remove(file_path)
-    return {"status": "success", "file_name": file.filename, "chunks": len(splits)}
+@app.get("/")
+def read_root():
+    return {"status": "Cloud Run (OpenAI) Server is Running"}
 
-@app.post("/chat")
-async def chat_stream(request: ChatRequest):
-    vectorstore = Chroma(persist_directory="/tmp/chroma_db", embedding_function=embeddings)
+@app.post("/build_rag")
+async def build_rag(file: UploadFile = File(...)):
+    """PDF 파일을 받아 텍스트를 추출하고 Chroma DB에 OpenAI 임베딩하여 저장"""
+    global vector_db
     
-    # ----------------------------------------------------
-    # [에러 우회] 다중 질문(MultiQuery) 로직 직접 구현
-    # 사용자의 질문을 3개로 다각화하여 검색 정확도를 높임
-    multi_query_prompt = ChatPromptTemplate.from_messages([
-        ("system", "사용자의 질문을 다각도로 분석하여 3개의 다른 형태의 질문으로 만들어주세요. 줄바꿈으로 구분하세요."),
-        ("human", "{question}")
-    ])
-    multi_queries_str = (multi_query_prompt | llm | StrOutputParser()).invoke({"question": request.query})
-    queries = multi_queries_str.split("\n") + [request.query]
-    
-    # 생성된 다중 질문으로 문서를 각각 검색 후 병합
-    retrieved_docs = []
-    retriever = vectorstore.as_retriever()
-    for q in queries:
-        if q.strip():
-            retrieved_docs.extend(retriever.invoke(q))
-    
-    # 중복 문서 제거
-    unique_docs = {doc.page_content: doc for doc in retrieved_docs}.values()
-    context_text = "\n\n".join([doc.page_content for doc in unique_docs])
-    # ----------------------------------------------------
+    # API 키 누락 방어 로직
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY 환경 변수가 설정되지 않았습니다.")
 
-    template = """당신은 도시 계획 설계자입니다. 특히 서울시에 특화된 설계자로 사용자의 질문에 답변하세요.
-    아래의 제공된 문서 내용을 바탕으로 답변을 작성하세요.
-    
-    참고 문서:
-    {context}
-    
-    사용자 질문: {question}
-    """
-    prompt = ChatPromptTemplate.from_template(template)
-    
-    rag_chain = (
-        prompt | llm | StrOutputParser()
-    )
+    try:
+        # 1. 업로드된 PDF를 임시 파일로 저장
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
 
-    async def generate_response():
-        yield f"data: {json.dumps({'type': 'meta', 'status': 'started'})}\n\n"
-        
-        # RunnablePassthrough 처럼 context와 question을 주입하여 스트리밍
-        async for chunk in rag_chain.astream({"context": context_text, "question": request.query}):
-            yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
+        # 2. PDF 로드 및 텍스트 추출
+        loader = PyPDFLoader(tmp_path)
+        documents = loader.load()
+
+        # 3. 청크 단위로 쪼개기
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_documents(documents)
+
+        # 4. OpenAI 임베딩 모델 적용하여 Chroma DB 생성
+        embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, openai_api_key=OPENAI_API_KEY)
+        vector_db = Chroma.from_documents(documents=chunks, embedding=embeddings)
+
+        os.remove(tmp_path) # 임시 파일 삭제
+        return {"message": "RAG 벡터 DB 생성 완료 (OpenAI 우회 적용)", "chunks_count": len(chunks)}
+    
+    except Exception as e:
+        # [실전 에러 방지 조건 3] 429 에러(크레딧 부족) 예외 처리
+        if "insufficient_quota" in str(e).lower() or "429" in str(e):
+            raise HTTPException(status_code=429, detail="OpenAI API 할당량(크레딧)이 초과되었습니다.")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ask")
+async def ask_question(request: QueryRequest):
+    """사용자의 질의를 받아 OpenAI RAG 기반 스트리밍 답변 생성"""
+    global vector_db
+    if vector_db is None:
+        raise HTTPException(status_code=400, detail="먼저 PDF 파일을 업로드하여 RAG를 구성해주세요.")
+
+    try:
+        # LLM 설정 (스트리밍 옵션 활성화)
+        llm = ChatOpenAI(model=LLM_MODEL, openai_api_key=OPENAI_API_KEY, temperature=0.2, streaming=True)
+
+        # 5. 다중 질문 검색기 (MultiQueryRetriever) 적용
+        retriever_from_llm = MultiQueryRetriever.from_llm(
+            retriever=vector_db.as_retriever(search_kwargs={"k": 3}), 
+            llm=llm
+        )
+
+        # 검색된 Context(출처) 먼저 가져오기
+        retrieved_docs = retriever_from_llm.invoke(request.query)
+        sources_text = "\n\n".join([f"- 출처 (페이지 {doc.metadata.get('page', '?')}): {doc.page_content[:150]}..." for doc in retrieved_docs])
+
+        # 6. 시스템 역할(Persona) 부여
+        base_prompt = hub.pull("rlm/rag-prompt")
+        system_msg = SystemMessagePromptTemplate.from_template(
+            "당신은 도시 계획 설계자입니다. 특히 서울시에 특화된 설계자로 사용자의 질문에 답변하세요.\n"
+            "제공된 문맥(Context)을 바탕으로 전문적이고 구체적인 답변을 작성하세요."
+        )
+        prompt = ChatPromptTemplate.from_messages([
+            system_msg,
+            HumanMessagePromptTemplate.from_template("Question: {question} \nContext: {context}")
+        ])
+
+        def format_docs(docs):
+            return "\n\n".join(doc.page_content for doc in docs)
+
+        # 7. 질의 확장 및 파이프라인 구성 (RunnablePassthrough 적용)
+        rag_chain = (
+            {"context": retriever_from_llm | format_docs, "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
+
+        # [실전 에러 방지 조건 4] 비동기 스트리밍 제너레이터 구현
+        async def stream_generator():
+            try:
+                # 첫 데이터로 출처 정보 전송
+                yield f"data: [SOURCES_START]{sources_text}[SOURCES_END]\n\n"
+                
+                # OpenAI LLM 스트리밍 응답
+                async for chunk in rag_chain.astream(request.query):
+                    yield f"data: {chunk}\n\n"
             
-        yield "data: [DONE]\n\n"
+            except Exception as e:
+                if "insufficient_quota" in str(e).lower() or "429" in str(e):
+                    yield f"data: \n\n[에러] OpenAI API 크레딧이 소진되었습니다.\n\n"
+                else:
+                    yield f"data: \n\n[에러] 답변 생성 중 오류 발생: {str(e)}\n\n"
 
-    return StreamingResponse(generate_response(), media_type="text/event-stream")
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
