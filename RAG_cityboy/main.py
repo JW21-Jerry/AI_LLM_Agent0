@@ -1,11 +1,10 @@
 import os
 import json
-import math
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List
 
 import google.generativeai as genai
 from langchain_core.embeddings import Embeddings
@@ -13,15 +12,15 @@ from langchain_core.embeddings import Embeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.vectorstores import SupabaseVectorStore
-from supabase.client import create_client, Client
-
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.vectorstores import Chroma
+from langchain.retrievers.multi_query import MultiQueryRetriever
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import HumanMessage, AIMessage
 
 app = FastAPI()
 
+# CORS 에러 방지 (시험용 완벽 설정)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,119 +30,82 @@ app.add_middleware(
 )
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# ---------------------------------------------------------
-# [최종 에러 방어] 구글 최신 임베딩 모델(gemini-embedding-001) 강제 적용 및 768차원 정규화 클래스
+# [필수] 구글 임베딩 모델 (404 에러 방지용 커스텀 클래스)
 genai.configure(api_key=GOOGLE_API_KEY)
-
-def get_768_embedding(text: str) -> List[float]:
-    # 최신 모델 이름(gemini-embedding-001)으로 원본 벡터 추출
-    emb = genai.embed_content(model="models/gemini-embedding-001", content=text)["embedding"]
-    # Supabase 크기에 맞게 768차원으로 자르기
-    emb_768 = emb[:768]
-    # 정확도 유지를 위한 L2 수학적 정규화
-    norm = math.sqrt(sum(x * x for x in emb_768))
-    if norm > 0:
-        emb_768 = [x / norm for x in emb_768]
-    return emb_768
-
 class DirectGoogleEmbeddings(Embeddings):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [get_768_embedding(t) for t in texts]
-
+        return [genai.embed_content(model="models/text-embedding-004", content=t)["embedding"] for t in texts]
     def embed_query(self, text: str) -> List[float]:
-        return get_768_embedding(text)
+        return genai.embed_content(model="models/text-embedding-004", content=text)["embedding"]
 
 embeddings = DirectGoogleEmbeddings()
-# ---------------------------------------------------------
-
 llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", google_api_key=GOOGLE_API_KEY, temperature=0.3)
 
 class ChatRequest(BaseModel):
     query: str
-    chat_history: List[Dict[str, str]]
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
+    """PDF를 읽어 Chroma DB에 저장합니다."""
     file_path = f"/tmp/{file.filename}"
     
     with open(file_path, "wb") as f:
         f.write(await file.read())
         
+    # PDF 변환 및 청크 쪼개기
     loader = PyPDFLoader(file_path)
     documents = loader.load()
-    
-    full_text = "\n".join([doc.page_content for doc in documents])
-    
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     splits = text_splitter.split_documents(documents)
     
-    SupabaseVectorStore.from_documents(
-        splits,
-        embeddings,
-        client=supabase,
-        table_name="documents",
-        query_name="match_documents"
+    # [필수] Chroma DB 사용 (클라우드 런 임시 폴더에 저장)
+    Chroma.from_documents(
+        documents=splits, 
+        embedding=embeddings, 
+        persist_directory="/tmp/chroma_db"
     )
     
     os.remove(file_path)
-    return {"status": "success", "file_name": file.filename, "content": full_text, "chunks": len(splits)}
+    return {"status": "success", "file_name": file.filename, "chunks": len(splits)}
 
 @app.post("/chat")
 async def chat_stream(request: ChatRequest):
-    history = []
-    for msg in request.chat_history:
-        if msg['role'] == 'user':
-            history.append(HumanMessage(content=msg['content']))
-        else:
-            history.append(AIMessage(content=msg['content']))
-
-    augmentation_prompt = ChatPromptTemplate.from_messages([
-        ("system", "기존의 대화 내용을 활용하여 사용자가 질문한 의도를 파악해서 한문장의 명료한 질문으로 변환하라. 대명사나 이, 저, 그와 같은 표현을 명확한 명사로 표현하라."),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "{question}")
-    ])
+    """다중 질문 검색기 및 RunnablePassthrough를 사용한 실시간 RAG"""
     
-    query_augmentation_chain = augmentation_prompt | llm | StrOutputParser()
+    # 저장된 Chroma DB 로드
+    vectorstore = Chroma(persist_directory="/tmp/chroma_db", embedding_function=embeddings)
     
-    augmented_query = query_augmentation_chain.invoke({
-        "chat_history": history,
-        "question": request.query
-    })
-
-    vectorstore = SupabaseVectorStore(
-        client=supabase,
-        embedding=embeddings,
-        table_name="documents",
-        query_name="match_documents"
+    # [필수] 다중 질문 검색기 (MultiQueryRetriever) 적용
+    retriever = MultiQueryRetriever.from_llm(
+        retriever=vectorstore.as_retriever(), llm=llm
     )
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    docs = retriever.invoke(augmented_query)
     
-    context_text = "\n\n".join([doc.page_content for doc in docs])
-    sources_info = [f"출처 페이지: {doc.metadata.get('page', '알수없음')}" for doc in docs]
-
-    rag_prompt = ChatPromptTemplate.from_messages([
-        ("system", "너는 문서에 기반해 답변하는 도시 정책 전문가야.\n\n참고 문서:\n{context}"),
-        ("human", "{question}")
-    ])
+    # [필수] 시스템 역할 정의
+    template = """당신은 도시 계획 설계자입니다. 특히 서울시에 특화된 설계자로 사용자의 질문에 답변하세요.
+    아래의 제공된 문서 내용을 바탕으로 답변을 작성하세요.
     
-    rag_chain = rag_prompt | llm | StrOutputParser()
+    참고 문서:
+    {context}
+    
+    사용자 질문: {question}
+    """
+    prompt = ChatPromptTemplate.from_template(template)
+    
+    # [필수] 질의 확장 - RunnablePassthrough 사용 (최신 LCEL 문법)
+    rag_chain = (
+        {"context": retriever, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
 
     async def generate_response():
-        meta_data = {
-            "type": "meta",
-            "augmented_query": augmented_query,
-            "sources": sources_info,
-            "context": context_text
-        }
-        yield f"data: {json.dumps(meta_data)}\n\n"
+        # 메타 데이터(스트리밍 시작 알림)
+        yield f"data: {json.dumps({'type': 'meta', 'status': 'started'})}\n\n"
         
-        async for chunk in rag_chain.astream({"context": context_text, "question": augmented_query}):
+        # 실시간 스트리밍 핸들러 (LCEL astream 활용)
+        async for chunk in rag_chain.astream(request.query):
             yield f"data: {json.dumps({'type': 'chunk', 'content': chunk})}\n\n"
             
         yield "data: [DONE]\n\n"
