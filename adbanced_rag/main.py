@@ -1,1180 +1,1054 @@
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Advanced Hybrid RAG (FAISS + BM25 + Multi-Query + RRF)</title>
-  <!--
-    ==========================================================================
-    Advanced Hybrid RAG 클라이언트 UI (index.html)
-    ==========================================================================
-    [주요 UI 구성 및 기능]
-    1. 서버와의 연동 상태 표시 영역:
-       - Cloud Run URL 환경변수 표시/변경, 연결 상태 배지(Online/Offline),
-         현재 활성 인덱스(IndexHNSWFlat / IndexFlatL2), 적재된 청크 수, 응답 지연시간 표시.
-    2. 알고리즘 시간/공간 복잡도 상시 및 동적 표시 패널:
-       - FAISS, BM25, Multi-Query(5가지), RRF 순위 융합의 이론적·실측 복잡도 표시.
-    3. 파일명 표시 및 파일 요청 버튼 + 벡터 DB 생성 버튼:
-       - Google Drive PDF 파일 요청 또는 로컬 PDF 파일 선택 지원.
-       - 선택된 PDF 파일명 및 용량 표시, FAISS 인덱스 방식 선택 후 벡터 DB 생성 요청.
-    4. 서버에서 RAG 생성 진행 현황 표시 영역:
-       - StreamHandler가 수신한 실시간 단계별 진행률 바(Progress Bar) 및 타임라인 로그 렌더링.
-    5. 질의 입력 영역 및 질의하기 버튼:
-       - 사용자의 자연어 질의 입력 및 RRF 하이퍼파라미터(Top-K, RRF k) 설정.
-    6. 답변 표시 영역 (분리형 레이아웃):
-       - [영역 A] 5가지 관점으로 확장된 Multi-Query 목록
-       - [영역 B] RAG 검색 내용: RRF로 재정렬된 상위 문서 스니펫, RRF 점수, FAISS/BM25 개별 순위, 메타데이터
-       - [영역 C] LLM 최종 답변 및 명확한 출처 표기 ([출처: 파일명 p.X, Chunk #Y])
-    7. 정확한 에러 표시 배너:
-       - 에러 코드(error_code), 발생 단계(stage), 원인 메시지, 상세 디버그 정보를 직관적으로 표시.
-    ==========================================================================
-  -->
-  <style>
-    :root {
-      --bg-primary: #0f172a;
-      --bg-card: #1e293b;
-      --bg-input: #0b1120;
-      --border-color: #334155;
-      --text-main: #f8fafc;
-      --text-muted: #94a3b8;
-      --accent-blue: #38bdf8;
-      --accent-indigo: #6366f1;
-      --accent-emerald: #10b981;
-      --accent-amber: #f59e0b;
-      --accent-rose: #f43f5e;
-      --font-sans: 'Pretendard', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      --font-mono: 'JetBrains Mono', Consolas, monospace;
-    }
-
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
-    body {
-      font-family: var(--font-sans);
-      background-color: var(--bg-primary);
-      color: var(--text-main);
-      line-height: 1.6;
-      padding: 24px;
-    }
-
-    .container {
-      max-width: 1280px;
-      margin: 0 auto;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-
-    /* 상단 헤더 및 서버 연동 상태 바 */
-    .header-bar {
-      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-      border: 1px solid var(--border-color);
-      border-radius: 12px;
-      padding: 20px 24px;
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 16px;
-    }
-
-    .title-group h1 {
-      font-size: 1.4rem;
-      font-weight: 700;
-      color: var(--text-main);
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .title-group p {
-      font-size: 0.88rem;
-      color: var(--text-muted);
-      margin-top: 4px;
-    }
-
-    .status-cluster {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .status-badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 14px;
-      border-radius: 9999px;
-      font-size: 0.82rem;
-      font-weight: 600;
-      border: 1px solid var(--border-color);
-      background: var(--bg-input);
-    }
-
-    .status-dot {
-      width: 9px;
-      height: 9px;
-      border-radius: 50%;
-      background-color: var(--accent-amber);
-    }
-
-    .status-dot.online {
-      background-color: var(--accent-emerald);
-      box-shadow: 0 0 8px var(--accent-emerald);
-    }
-
-    .status-dot.offline {
-      background-color: var(--accent-rose);
-      box-shadow: 0 0 8px var(--accent-rose);
-    }
-
-    /* 공통 카드 스타일 */
-    .card {
-      background-color: var(--bg-card);
-      border: 1px solid var(--border-color);
-      border-radius: 12px;
-      padding: 20px 24px;
-    }
-
-    .card-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 14px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid var(--border-color);
-    }
-
-    .card-title {
-      font-size: 1.05rem;
-      font-weight: 700;
-      color: var(--accent-blue);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    /* 알고리즘 복잡도 표시 그리드 */
-    .complexity-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 12px;
-    }
-
-    .complexity-item {
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 10px 14px;
-    }
-
-    .complexity-item .label {
-      font-size: 0.76rem;
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.04em;
-    }
-
-    .complexity-item .formula {
-      font-family: var(--font-mono);
-      font-size: 0.86rem;
-      color: var(--accent-emerald);
-      margin-top: 4px;
-      font-weight: 600;
-    }
-
-    /* 폼 및 버튼 스타일 */
-    .row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      align-items: center;
-    }
-
-    input[type="text"],
-    input[type="number"],
-    select,
-    textarea {
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 0.92rem;
-      font-family: var(--font-sans);
-      outline: none;
-      transition: border-color 0.15s;
-    }
-
-    input:focus,
-    select:focus,
-    textarea:focus {
-      border-color: var(--accent-blue);
-    }
-
-    .btn {
-      cursor: pointer;
-      border: none;
-      border-radius: 8px;
-      padding: 10px 18px;
-      font-size: 0.9rem;
-      font-weight: 600;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      transition: opacity 0.15s, transform 0.1s;
-    }
-
-    .btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    .btn:active:not(:disabled) {
-      transform: translateY(1px);
-    }
-
-    .btn-primary {
-      background: var(--accent-indigo);
-      color: #fff;
-    }
-
-    .btn-emerald {
-      background: var(--accent-emerald);
-      color: #052e16;
-    }
-
-    .btn-outline {
-      background: transparent;
-      border: 1px solid var(--border-color);
-      color: var(--text-main);
-    }
-
-    /* 파일명 표시 배지 */
-    .file-display-box {
-      flex: 1;
-      min-width: 260px;
-      background: var(--bg-input);
-      border: 1px dashed var(--border-color);
-      border-radius: 8px;
-      padding: 10px 14px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-size: 0.9rem;
-    }
-
-    .file-name-tag {
-      font-weight: 600;
-      color: var(--accent-blue);
-    }
-
-    /* 진행 현황(Progress Bar & Stream Log) 영역 */
-    .progress-wrapper {
-      margin-top: 14px;
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 14px;
-    }
-
-    .progress-bar-track {
-      width: 100%;
-      height: 10px;
-      background: #1e293b;
-      border-radius: 999px;
-      overflow: hidden;
-      margin: 8px 0 12px 0;
-    }
-
-    .progress-bar-fill {
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, var(--accent-indigo), var(--accent-emerald));
-      transition: width 0.3s ease;
-    }
-
-    .stream-log-list {
-      list-style: none;
-      max-height: 160px;
-      overflow-y: auto;
-      font-family: var(--font-mono);
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-
-    .stream-log-list li {
-      padding: 4px 8px;
-      border-left: 3px solid var(--accent-blue);
-      background: rgba(56, 189, 248, 0.05);
-    }
-
-    /* 에러 표시 배너 */
-    .error-banner {
-      display: none;
-      background: rgba(244, 63, 94, 0.12);
-      border: 1px solid var(--accent-rose);
-      border-radius: 10px;
-      padding: 16px 20px;
-      color: #fecdd3;
-    }
-
-    .error-banner.active {
-      display: block;
-    }
-
-    .error-header {
-      font-weight: 700;
-      color: var(--accent-rose);
-      margin-bottom: 6px;
-      display: flex;
-      justify-content: space-between;
-    }
-
-    .error-detail {
-      font-family: var(--font-mono);
-      font-size: 0.8rem;
-      background: rgba(0, 0, 0, 0.35);
-      padding: 8px 10px;
-      border-radius: 6px;
-      margin-top: 8px;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-
-    /* 분리된 결과 표시 영역 (2열 레이아웃) */
-    .results-split {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 20px;
-    }
-
-    @media (max-width: 960px) {
-      .results-split {
-        grid-template-columns: 1fr;
-      }
-    }
-
-    /* 확장 쿼리 칩 */
-    .multi-query-list {
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      margin-bottom: 16px;
-    }
-
-    .mq-item {
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 8px 12px;
-      font-size: 0.85rem;
-    }
-
-    .mq-perspective {
-      font-size: 0.75rem;
-      font-weight: 700;
-      color: var(--accent-amber);
-      display: block;
-    }
-
-    /* RRF 검색 문서 카드 */
-    .doc-card {
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      border-radius: 10px;
-      padding: 14px;
-      margin-bottom: 12px;
-    }
-
-    .doc-card-header {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      gap: 8px;
-      margin-bottom: 8px;
-      padding-bottom: 8px;
-      border-bottom: 1px dashed var(--border-color);
-    }
-
-    .badge {
-      padding: 2px 8px;
-      border-radius: 6px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      font-family: var(--font-mono);
-    }
-
-    .badge-rrf {
-      background: rgba(16, 185, 129, 0.18);
-      color: var(--accent-emerald);
-      border: 1px solid var(--accent-emerald);
-    }
-
-    .badge-faiss {
-      background: rgba(56, 189, 248, 0.15);
-      color: var(--accent-blue);
-    }
-
-    .badge-bm25 {
-      background: rgba(245, 158, 11, 0.15);
-      color: var(--accent-amber);
-    }
-
-    .badge-source {
-      background: rgba(99, 102, 241, 0.2);
-      color: #c7d2fe;
-    }
-
-    .doc-snippet {
-      font-size: 0.88rem;
-      color: #e2e8f0;
-      white-space: pre-wrap;
-    }
-
-    /* LLM 답변 및 출처 카드 */
-    .llm-answer-box {
-      background: var(--bg-input);
-      border: 1px solid var(--border-color);
-      border-radius: 10px;
-      padding: 18px;
-      font-size: 0.94rem;
-      white-space: pre-wrap;
-      line-height: 1.75;
-    }
-
-    .citation-pill {
-      display: inline-block;
-      background: rgba(99, 102, 241, 0.25);
-      border: 1px solid var(--accent-indigo);
-      color: #e0e7ff;
-      padding: 1px 8px;
-      border-radius: 6px;
-      font-size: 0.8rem;
-      font-weight: 600;
-      margin: 2px;
-    }
-
-    .sources-footer {
-      margin-top: 14px;
-      padding-top: 12px;
-      border-top: 1px solid var(--border-color);
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <!-- 1. 상단 서버 연동 상태 표시 헤더 -->
-    <header class="header-bar">
-      <div class="title-group">
-        <h1>⚡ Advanced Hybrid RAG &amp; RRF Fusion System</h1>
-        <p>FAISS Dense Vector + BM25 Sparse Keyword | 5-Way Multi-Query Expansion | Reciprocal Rank Fusion</p>
-      </div>
-      <div class="status-cluster">
-        <div class="status-badge" title="백엔드 서버와의 실시간 연동 상태">
-          <span id="serverStatusDot" class="status-dot"></span>
-          <span id="serverStatusText">서버 상태 확인 중...</span>
-        </div>
-        <div class="status-badge" id="dbIndexBadge">인덱스: 미구축 (0 Chunks)</div>
-        <div class="status-badge" id="latencyBadge">지연시간: - ms</div>
-        <button class="btn btn-outline" onclick="refreshServerStatus()">🔄 연동 상태 확인</button>
-      </div>
-    </header>
-
-    <!-- Cloud Run URL 환경변수 설정 바 -->
-    <section class="card">
-      <div class="row" style="justify-content: space-between;">
-        <div class="row" style="flex: 1;">
-          <strong style="font-size: 0.88rem; color: var(--text-muted);">Cloud Run 백엔드 URL (환경변수 CLOUD_RUN_URL):</strong>
-          <input type="text" id="cloudRunUrlInput" style="flex: 1; min-width: 280px;" placeholder="http://localhost:8080 또는 https://your-service.a.run.app" value="http://localhost:8080" />
-          <button class="btn btn-outline" onclick="updateCloudRunUrl()">환경변수 저장 및 연결</button>
-        </div>
-      </div>
-    </section>
-
-    <!-- 공통 에러 표시 영역 (에러 발생 시에만 활성화) -->
-    <div id="errorBanner" class="error-banner" role="alert">
-      <div class="error-header">
-        <span id="errorTitle">⚠️ 오류가 발생했습니다</span>
-        <button class="btn btn-outline" style="padding: 2px 10px; font-size: 0.78rem;" onclick="clearError()">닫기</button>
-      </div>
-      <div id="errorMessage" style="font-size: 0.9rem;"></div>
-      <div id="errorDetail" class="error-detail"></div>
-    </div>
-
-    <!-- 2. 알고리즘 복잡도 표시 패널 -->
-    <section class="card">
-      <div class="card-header">
-        <div class="card-title">📐 파이프라인 알고리즘 시간·공간 복잡도 (Algorithmic Complexity)</div>
-        <span id="activeComplexityMode" style="font-size: 0.8rem; color: var(--text-muted);">실시간 메트릭 연동됨</span>
-      </div>
-      <div class="complexity-grid">
-        <div class="complexity-item">
-          <div class="label">1. 다중 쿼리 확장 (Multi-Query, M=5)</div>
-          <div class="formula" id="compMultiQuery">Time: O(M) [M = 5 관점]</div>
-        </div>
-        <div class="complexity-item">
-          <div class="label">2. FAISS Dense 벡터 검색</div>
-          <div class="formula" id="compFaiss">HNSW: O(M · d · log N) / FlatL2: O(M · N · d)</div>
-        </div>
-        <div class="complexity-item">
-          <div class="label">3. BM25 Sparse 키워드 검색</div>
-          <div class="formula" id="compBm25">Time: O(M · |Q| · N)</div>
-        </div>
-        <div class="complexity-item">
-          <div class="label">4. RRF 순위 융합 및 재정렬</div>
-          <div class="formula" id="compRrf">Time: O(M · K + U log U), Space: O(N·d + U)</div>
-        </div>
-      </div>
-    </section>
-
-    <!-- 3. 파일명 표시, 파일 요청 버튼, 벡터 DB 생성 버튼 및 진행 현황 영역 -->
-    <section class="card">
-      <div class="card-header">
-        <div class="card-title">📄 1단계: PDF 파일 요청 및 FAISS + BM25 하이브리드 벡터 DB 생성</div>
-      </div>
-
-      <div class="row" style="margin-bottom: 12px;">
-        <!-- 파일명 표시 상자 -->
-        <div class="file-display-box">
-          <div>
-            <span style="color: var(--text-muted); font-size: 0.82rem;">선택된 PDF 파일: </span>
-            <span id="selectedFileName" class="file-name-tag">선택된 파일 없음</span>
-          </div>
-          <span id="selectedFileSize" style="font-size: 0.8rem; color: var(--text-muted);">0 KB</span>
-        </div>
-
-        <!-- Google Drive 검색어(선택) 및 파일 요청 버튼 -->
-        <input type="text" id="driveSearchInput" placeholder="Drive PDF 파일명(비우면 최근 PDF)" style="width: 220px;" />
-        <button class="btn btn-outline" id="btnRequestDriveFile" onclick="handleRequestPdfFile()">📂 파일 요청 (Drive/로컬)</button>
-        <input type="file" id="localPdfInput" accept="application/pdf" style="display: none;" onchange="handleLocalPdfSelected(event)" />
-        <button class="btn btn-outline" onclick="document.getElementById('localPdfInput').click()">💻 로컬 PDF 파일 선택</button>
-      </div>
-
-      <div class="row" style="justify-content: space-between;">
-        <div class="row">
-          <label style="font-size: 0.85rem; color: var(--text-muted);">FAISS 인덱스 방식:</label>
-          <select id="faissIndexType">
-            <option value="IndexHNSWFlat" selected>IndexHNSWFlat (계층 그래프 근사 탐색 - O(d log N))</option>
-            <option value="IndexFlatL2">IndexFlatL2 (전수 L2 거리 탐색 - O(N d))</option>
-          </select>
-
-          <label style="font-size: 0.85rem; color: var(--text-muted);">청크 크기:</label>
-          <input type="number" id="chunkSizeInput" value="500" min="150" max="2000" style="width: 90px;" />
-        </div>
-
-        <!-- 벡터 DB 생성 버튼 -->
-        <button class="btn btn-emerald" id="btnBuildDb" onclick="handleBuildVectorDB()">
-          🚀 벡터 DB 생성 (FAISS + BM25 인덱싱)
-        </button>
-      </div>
-
-      <!-- 서버에서 RAG 생성 진행 현황 표시 영역 -->
-      <div class="progress-wrapper">
-        <div style="display: flex; justify-content: space-between; font-size: 0.85rem;">
-          <span id="ragProgressStatus">대기 중 — PDF 파일을 요청하거나 선택한 뒤 [벡터 DB 생성] 버튼을 눌러주세요.</span>
-          <span id="ragProgressPercent" style="font-weight: 700; color: var(--accent-emerald);">0%</span>
-        </div>
-        <div class="progress-bar-track">
-          <div id="ragProgressBar" class="progress-bar-fill"></div>
-        </div>
-        <ul id="ragStreamLogs" class="stream-log-list">
-          <li>[SYSTEM] StreamHandler 대기 중...</li>
-        </ul>
-      </div>
-    </section>
-
-    <!-- 4. 질의 입력 영역 및 질의하기 버튼 -->
-    <section class="card">
-      <div class="card-header">
-        <div class="card-title">🔍 2단계: Multi-Query (5개 확장) + Hybrid Search + RRF 융합 질의하기</div>
-      </div>
-
-      <div class="row" style="margin-bottom: 12px;">
-        <input
-          type="text"
-          id="userQueryInput"
-          style="flex: 1; font-size: 1rem; padding: 12px 16px;"
-          placeholder="질의 내용을 입력하세요 (예: 이 문서의 핵심 아키텍처와 주요 장단점은 무엇인가요?)"
-          onkeydown="if(event.key === 'Enter') handleQueryRAG();"
-        />
-        <button class="btn btn-primary" id="btnQueryRag" onclick="handleQueryRAG()" style="padding: 12px 24px;">
-          ✨ 질의하기 (Hybrid RAG Fusion)
-        </button>
-      </div>
-
-      <div class="row" style="font-size: 0.84rem; color: var(--text-muted);">
-        <span>상위 반환 문서 수 (Top-K):</span>
-        <input type="number" id="topKInput" value="5" min="1" max="15" style="width: 70px; padding: 6px 10px;" />
-        <span>RRF 상수 (k):</span>
-        <input type="number" id="rrfKInput" value="60" min="1" max="120" style="width: 75px; padding: 6px 10px;" />
-        <span>FAISS Dense 가중치:</span>
-        <input type="number" id="denseWeightInput" value="1.0" step="0.1" min="0" max="5" style="width: 75px; padding: 6px 10px;" />
-        <span>BM25 Sparse 가중치:</span>
-        <input type="number" id="sparseWeightInput" value="1.0" step="0.1" min="0" max="5" style="width: 75px; padding: 6px 10px;" />
-      </div>
-    </section>
-
-    <!-- 5. 답변 표시 영역 (RAG 검색 내용과 LLM 답변 분리 표시 + 출처 표기) -->
-    <div class="results-split">
-      <!-- 좌측: 다중 쿼리 확장(5가지) + RRF 재정렬 RAG 검색 내용 -->
-      <section class="card">
-        <div class="card-header">
-          <div class="card-title">📚 RAG 검색 결과 (5-Way Multi-Query &amp; RRF 상위 스니펫)</div>
-          <span id="searchTimingBadge" class="badge badge-faiss">대기 중</span>
-        </div>
-
-        <h4 style="font-size: 0.86rem; color: var(--text-muted); margin-bottom: 8px;">
-          ① LLM 다중 쿼리 확장 계층 (5가지 관점 파생 쿼리)
-        </h4>
-        <div id="multiQueryContainer" class="multi-query-list">
-          <div class="mq-item" style="color: var(--text-muted);">질의를 실행하면 5가지 관점으로 확장된 파생 쿼리가 여기에 표시됩니다.</div>
-        </div>
-
-        <h4 style="font-size: 0.86rem; color: var(--text-muted); margin: 14px 0 8px 0;">
-          ② RRF (Reciprocal Rank Fusion) 재정렬 상위 문서 스니펫 및 메타데이터
-        </h4>
-        <div id="ragDocumentsContainer">
-          <div class="doc-card" style="color: var(--text-muted);">
-            FAISS Dense 유사도 순위와 BM25 키워드 매칭 순위를 RRF 공식으로 융합한 상위 문서 스니펫과 출처 메타데이터가 여기에 표시됩니다.
-          </div>
-        </div>
-      </section>
-
-      <!-- 우측: LLM 최종 답변 및 명확한 출처 표기 -->
-      <section class="card">
-        <div class="card-header">
-          <div class="card-title">🤖 LLM 종합 답변 및 출처 (Citations)</div>
-          <span id="llmTimingBadge" class="badge badge-rrf">대기 중</span>
-        </div>
-
-        <div id="llmAnswerContainer" class="llm-answer-box">
-          질의를 실행하면 우측 영역에 RRF 상위 문서를 근거로 합성된 LLM의 최종 답변이 RAG 검색 스니펫과 분리되어 표시됩니다.
-        </div>
-
-        <div class="sources-footer">
-          <div style="font-size: 0.84rem; font-weight: 700; color: var(--text-muted); margin-bottom: 8px;">
-            📌 인용된 문서 출처 목록 (Verified Sources)
-          </div>
-          <div id="citationListContainer" style="display: flex; flex-wrap: wrap; gap: 6px;">
-            <span style="font-size: 0.82rem; color: var(--text-muted);">아직 표시할 출처가 없습니다.</span>
-          </div>
-        </div>
-      </section>
-    </div>
-  </div>
-
-  <script>
-    /**
-     * ========================================================================
-     * 클라이언트 상태 관리 및 GAS / 직접 HTTP 하이브리드 브릿지
-     * ========================================================================
-     * - Google Apps Script 웹앱 환경에서는 `google.script.run`을 통해 `Code.gs`의
-     *   `StreamHandler` 및 `UrlFetchApp`을 호출합니다.
-     * - 로컬 브라우저에서 직접 `index.html`을 열어 테스트할 때에도 즉시 동작하도록
-     *   자동으로 `fetch()` 기반 클라이언트 `StreamHandler` 폴백을 지원합니다.
-     */
-    const AppState = {
-      fileName: null,
-      pdfBase64: null,
-      fileSizeBytes: 0,
-      isGasEnv: typeof google !== 'undefined' && google.script && google.script.run
-    };
-
-    /** 에러 배너 표시 함수 (정확한 단계, 에러 코드, 원인, 세부내용 표시) */
-    function showError(stage, code, message, detail) {
-      const banner = document.getElementById('errorBanner');
-      document.getElementById('errorTitle').textContent = `⚠️ [${stage}] 오류 발생 (코드: ${code})`;
-      document.getElementById('errorMessage').textContent = message || '알 수 없는 오류가 발생했습니다.';
-      const detailEl = document.getElementById('errorDetail');
-      if (detail) {
-        detailEl.style.display = 'block';
-        detailEl.textContent = detail;
-      } else {
-        detailEl.style.display = 'none';
-      }
-      banner.classList.add('active');
-    }
-
-    function clearError() {
-      document.getElementById('errorBanner').classList.remove('active');
-    }
-
-    /** 진행률 바 및 스트림 로그 업데이트 함수 */
-    function updateProgressUI(percent, statusText, logLine) {
-      document.getElementById('ragProgressBar').style.width = `${Math.max(0, Math.min(100, percent))}%`;
-      document.getElementById('ragProgressPercent').textContent = `${Math.round(percent)}%`;
-      if (statusText) {
-        document.getElementById('ragProgressStatus').textContent = statusText;
-      }
-      if (logLine) {
-        const ul = document.getElementById('ragStreamLogs');
-        const li = document.createElement('li');
-        const now = new Date().toLocaleTimeString();
-        li.textContent = `[${now}] ${logLine}`;
-        ul.appendChild(li);
-        ul.scrollTop = ul.scrollHeight;
-      }
-    }
-
-    /** 알고리즘 복잡도 UI 패널 업데이트 */
-    function updateComplexityUI(comp) {
-      if (!comp) return;
-      if (comp.multi_query_expansion || comp.multi_query) {
-        document.getElementById('compMultiQuery').textContent = comp.multi_query_expansion || comp.multi_query;
-      }
-      if (comp.faiss_dense_search || comp.faiss_build || comp.faiss_search_per_query) {
-        document.getElementById('compFaiss').textContent =
-          comp.faiss_dense_search || comp.faiss_search_per_query || comp.faiss_build;
-      }
-      if (comp.bm25_sparse_search || comp.bm25_build) {
-        document.getElementById('compBm25').textContent = comp.bm25_sparse_search || comp.bm25_build;
-      }
-      if (comp.rrf_fusion_rerank || comp.space_complexity) {
-        document.getElementById('compRrf').textContent =
-          (comp.rrf_fusion_rerank ? comp.rrf_fusion_rerank + ' | ' : '') + (comp.space_complexity || '');
-      }
-    }
-
-    /**
-     * 1. 서버 연동 상태 확인 (GAS checkServerHealth 또는 직접 /health 호출)
-     */
-    async function refreshServerStatus() {
-      const dot = document.getElementById('serverStatusDot');
-      const text = document.getElementById('serverStatusText');
-      const dbBadge = document.getElementById('dbIndexBadge');
-      const latencyBadge = document.getElementById('latencyBadge');
-
-      text.textContent = '연결 확인 중...';
-
-      if (AppState.isGasEnv) {
-        google.script.run
-          .withSuccessHandler((res) => applyHealthResponse(res))
-          .withFailureHandler((err) => {
-            dot.className = 'status-dot offline';
-            text.textContent = 'GAS 오류';
-            showError('GAS_BRIDGE', 'ERR_GAS_RPC', err.message || String(err));
-          })
-          .checkServerHealth();
-      } else {
-        const baseUrl = document.getElementById('cloudRunUrlInput').value.trim().replace(/\/+$/, '');
-        const t0 = performance.now();
-        try {
-          const resp = await fetch(`${baseUrl}/health`);
-          const latencyMs = Math.round(performance.now() - t0);
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          const info = await resp.json();
-          applyHealthResponse({
-            status: 'online',
-            cloudRunUrl: baseUrl,
-            latencyMs,
-            serverInfo: info
-          });
-        } catch (err) {
-          dot.className = 'status-dot offline';
-          text.textContent = '서버 오프라인 (미연결)';
-          latencyBadge.textContent = '지연시간: - ms';
+"""
+================================================================================
+Advanced RAG Backend Server (FastAPI + FAISS + BM25 + Multi-Query + RRF Fusion)
+================================================================================
+[아키텍처 개요]
+1. FAISS Index 구축 계층 (Dense Vector Layer):
+   - 고차원 임베딩 벡터 검색을 위해 FAISS `IndexFlatL2`(정확한 전수 L2 거리 검색) 또는
+     `IndexHNSWFlat`(계층적 탐색 가능 소세계 그래프 기반 근사 최근접 이웃 검색)을 지원합니다.
+2. 다중 쿼리 확장 계층 (Multi-Query Expansion Layer):
+   - 사용자의 단일 질의를 LLM을 통해 5가지 서로 다른 관점(정의/원리, 실무/적용, 비교/대조,
+     한계/주의점, 키워드 중심)의 파생 쿼리로 확장하여 단일 쿼리의 어휘 불일치 및 누락을 방지합니다.
+3. 하이브리드 검색 계층 (Hybrid Search Layer - Dense FAISS + Sparse BM25):
+   - 확장된 5개 쿼리(및 원본 쿼리) 각각에 대해:
+     (a) FAISS Dense Vector 검색 (문맥/의미적 유사도)
+     (b) Okapi BM25 Sparse 키워드 검색 (정확한 용어/고유명사 매칭)
+     을 병렬/연속 수행합니다.
+4. RRF 순위 융합 계층 (RAG Fusion & Reciprocal Rank Fusion Layer):
+   - 다중 쿼리 × 하이브리드 검색 경로에서 수집된 모든 문서 순위를 RRF 공식으로 통합:
+     RRF_Score(d) = Σ_{m ∈ Queries} [ w_dense / (k + rank_FAISS(d, m)) + w_sparse / (k + rank_BM25(d, m)) ]
+   - 상수 k=60을 적용하여 상위 편향을 완화하고, 다수 쿼리와 양쪽 검색기에서 고르게 상위권에
+     등장한 문서를 최상위로 재정렬(Re-ranking)합니다.
+5. 실시간 스트리밍 핸들러 (StreamHandler):
+   - NDJSON(Newline Delimited JSON) 기반 스트리밍 응답을 통해 백엔드 진행률, 단계별 상태,
+     중간 검색 결과, 최종 답변을 실시간으로 GAS 클라이언트에 전달합니다.
+
+[알고리즘 복잡도 (Algorithmic Complexity)]
+- 문서 청킹 및 전처리: 시간 O(C) (C: 전체 문자 수), 공간 O(N * L) (N: 청크 수, L: 평균 청크 길이)
+- FAISS 인덱스 구축:
+  * IndexFlatL2: 구축 시간 O(N * d), 검색 시간 O(N * d), 공간 O(N * d)
+  * IndexHNSWFlat: 구축 시간 O(N * d * log N), 검색 시간 O(d * log N), 공간 O(N * (d + M_hnsw))
+- BM25 인덱스 구축 및 검색:
+  * 구축 시간 O(N * L_tokens), 쿼리당 검색 시간 O(|q| * N_postings) ≤ O(|q| * N)
+- 다중 쿼리 하이브리드 검색 (M=5 확장 쿼리):
+  * 총 검색 시간 O(M * (T_FAISS + T_BM25))
+- RRF 순위 융합 및 재정렬:
+  * 시간 O(M * K_cand + U * log U) (K_cand: 경로당 후보 수, U ≤ 2*M*K_cand: 고유 후보 문서 수)
+  * 공간 O(U)
+================================================================================
+"""
+
+import base64
+import io
+import json
+import logging
+import math
+import os
+import re
+import time
+import traceback
+from dataclasses import dataclass, field, asdict
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
+import faiss
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from pypdf import PdfReader
+from rank_bm25 import BM25Okapi
+
+# 선택적 Google Gemini / OpenAI SDK 로드 (미설치 또는 API 키 미설정 시 결정론적 폴백 제공)
+try:
+    from google import genai
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("advanced_rag_server")
+
+
+# ==============================================================================
+# 1. 데이터 모델 및 요청/응답 스키마 정의
+# ==============================================================================
+
+class BuildDBRequest(BaseModel):
+    """벡터 DB 생성 요청 스키마 (GAS에서 PDF Base64 또는 텍스트 전송)"""
+    file_name: str = Field(..., description="원본 PDF 파일명")
+    pdf_base64: Optional[str] = Field(None, description="Base64 인코딩된 PDF 바이너리 데이터")
+    raw_text: Optional[str] = Field(None, description="직접 전달된 텍스트 (PDF 외 테스트용)")
+    index_type: str = Field("IndexHNSWFlat", description="FAISS 인덱스 타입 ('IndexFlatL2' 또는 'IndexHNSWFlat')")
+    chunk_size: int = Field(500, ge=100, le=2000, description="청크당 최대 문자 수")
+    chunk_overlap: int = Field(100, ge=0, le=500, description="청크 간 중첩 문자 수")
+    stream: bool = Field(False, description="실시간 스트리밍(NDJSON) 응답 여부")
+
+
+class QueryRequest(BaseModel):
+    """하이브리드 Multi-Query + RRF 질의 요청 스키마"""
+    query: str = Field(..., min_length=1, description="사용자의 단일 입력 질의")
+    top_k: int = Field(5, ge=1, le=20, description="최종 반환할 상위 RRF 문서 수")
+    rrf_k: int = Field(60, ge=1, le=200, description="RRF 수식의 평활화 상수 k (기본값 60)")
+    dense_weight: float = Field(1.0, ge=0.0, le=5.0, description="FAISS Dense 검색 가중치")
+    sparse_weight: float = Field(1.0, ge=0.0, le=5.0, description="BM25 Sparse 검색 가중치")
+    stream: bool = Field(False, description="실시간 스트리밍(NDJSON) 응답 여부")
+
+
+@dataclass
+class DocumentChunk:
+    """단일 문서 청크 및 출처 메타데이터 구조체"""
+    doc_id: int
+    file_name: str
+    page_number: int
+    chunk_index: int
+    content: str
+    token_count: int
+    char_count: int
+
+
+# ==============================================================================
+# 2. 실시간 스트리밍 핸들러 (StreamHandler)
+# ==============================================================================
+
+class StreamHandler:
+    """
+    서버 측 실시간 스트리밍 핸들러 (Server-side StreamHandler)
+    ------------------------------------------------------------------------
+    파이프라인의 각 단계(PDF 파싱 -> 청킹 -> 임베딩 -> FAISS/BM25 인덱싱 또는
+    다중 쿼리 생성 -> 하이브리드 검색 -> RRF 융합 -> LLM 답변 생성)마다
+    진행 상태(progress), 단계명(stage), 알고리즘 복잡도(complexity), 데이터 페이로드를
+    NDJSON(Newline-Delimited JSON) 프레임으로 직렬화하여 전송합니다.
+    """
+
+    @staticmethod
+    def format_event(
+        event_type: str,
+        stage: str,
+        progress: int,
+        message: str,
+        data: Optional[Dict[str, Any]] = None,
+        complexity: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """단일 스트리밍 이벤트를 JSON 라인(개행 포함)으로 직렬화"""
+        payload = {
+            "event": event_type,          # "progress" | "partial_result" | "complete" | "error"
+            "stage": stage,               # 현재 파이프라인 단계 식별자
+            "progress": max(0, min(100, progress)),
+            "message": message,
+            "timestamp": round(time.time(), 4),
+            "complexity": complexity or {},
+            "data": data or {},
         }
-      }
-    }
+        return json.dumps(payload, ensure_ascii=False) + "\n"
 
-    function applyHealthResponse(res) {
-      const dot = document.getElementById('serverStatusDot');
-      const text = document.getElementById('serverStatusText');
-      const dbBadge = document.getElementById('dbIndexBadge');
-      const latencyBadge = document.getElementById('latencyBadge');
-
-      if (res.cloudRunUrl) {
-        document.getElementById('cloudRunUrlInput').value = res.cloudRunUrl;
-      }
-
-      if (res.status === 'online' && res.serverInfo) {
-        dot.className = 'status-dot online';
-        text.textContent = `서버 연결됨 (${res.serverInfo.engine_mode})`;
-        latencyBadge.textContent = `지연시간: ${res.latencyMs} ms`;
-        if (res.serverInfo.db_ready) {
-          dbBadge.textContent = `인덱스: ${res.serverInfo.index_type} (${res.serverInfo.total_chunks} Chunks | ${res.serverInfo.active_file_name})`;
-        } else {
-          dbBadge.textContent = '인덱스: 미구축 (0 Chunks)';
+    @staticmethod
+    def format_error(
+        stage: str,
+        error_code: str,
+        message: str,
+        detail: str = "",
+    ) -> str:
+        """에러 발생 시 정확한 원인 및 단계 정보를 담은 스트리밍 에러 프레임 생성"""
+        payload = {
+            "event": "error",
+            "stage": stage,
+            "progress": 0,
+            "error": {
+                "error_code": error_code,
+                "stage": stage,
+                "message": message,
+                "detail": detail,
+            },
+            "timestamp": round(time.time(), 4),
         }
-      } else {
-        dot.className = 'status-dot offline';
-        text.textContent = '서버 오프라인';
-        if (res.error) {
-          showError(res.error.stage, res.error.error_code, res.error.message, res.error.detail);
-        }
-      }
-    }
+        return json.dumps(payload, ensure_ascii=False) + "\n"
 
-    /** Cloud Run URL 환경변수 업데이트 */
-    function updateCloudRunUrl() {
-      clearError();
-      const newUrl = document.getElementById('cloudRunUrlInput').value.trim();
-      if (AppState.isGasEnv) {
-        google.script.run
-          .withSuccessHandler((res) => applyHealthResponse(res))
-          .withFailureHandler((err) => showError('ENV_SAVE', 'ERR_SAVE_URL', err.message))
-          .saveCloudRunUrl(newUrl);
-      } else {
-        refreshServerStatus();
-      }
-    }
 
-    /**
-     * 2. 파일 요청 버튼 처리 (GAS 환경에서는 Google Drive PDF 요청, 로컬에서는 파일 선택창 오픈)
-     */
-    function handleRequestPdfFile() {
-      clearError();
-      const keyword = document.getElementById('driveSearchInput').value.trim();
+# ==============================================================================
+# 3. 텍스트 토크나이저 및 임베딩/LLM 어댑터
+# ==============================================================================
 
-      if (AppState.isGasEnv) {
-        updateProgressUI(5, 'Google Drive에서 PDF 파일을 요청하는 중...', `[DRIVE] 파일 검색어: "${keyword || '최근 PDF'}"`);
-        google.script.run
-          .withSuccessHandler((res) => {
-            if (res.status === 'error') {
-              showError(res.error.stage, res.error.error_code, res.error.message, res.error.detail);
-              updateProgressUI(0, '파일 요청 실패', `[ERROR] ${res.error.message}`);
-              return;
-            }
-            AppState.fileName = res.fileName;
-            AppState.pdfBase64 = res.pdfBase64;
-            AppState.fileSizeBytes = res.fileSizeBytes;
-            document.getElementById('selectedFileName').textContent = res.fileName;
-            document.getElementById('selectedFileSize').textContent = `${(res.fileSizeBytes / 1024).toFixed(1)} KB`;
-            updateProgressUI(15, `'${res.fileName}' 파일 준비 완료. [벡터 DB 생성]을 눌러주세요.`, `[DRIVE] '${res.fileName}' 로드 성공`);
-          })
-          .withFailureHandler((err) => {
-            showError('DRIVE_RPC', 'ERR_GAS_DRIVE_CALL', err.message || String(err));
-          })
-          .requestPdfFromDrive(keyword);
-      } else {
-        // 로컬 브라우저에서 테스트 시 로컬 PDF 선택 다이얼로그 호출
-        document.getElementById('localPdfInput').click();
-      }
-    }
+class KoreanEnglishTokenizer:
+    """
+    한영 혼합 문서를 위한 경량 형태소/N-gram 겸용 토크나이저
+    ------------------------------------------------------------------------
+    BM25 키워드 매칭 시 한국어 조사 결합으로 인한 누락을 방지하기 위해
+    어절 단위 토큰과 2-gram(바이그램) 서브워드 토큰을 함께 추출합니다.
+    - 시간 복잡도: O(L) (L: 입력 문자열 길이)
+    - 공간 복잡도: O(T) (T: 추출된 토큰 수)
+    """
 
-    /** 로컬 PDF 파일 선택 시 Base64 인코딩 및 파일명 표시 */
-    function handleLocalPdfSelected(event) {
-      clearError();
-      const file = event.target.files && event.target.files[0];
-      if (!file) return;
+    TOKEN_PATTERN = re.compile(r"[가-힣a-zA-Z0-9]+")
+    STOPWORDS = {"이", "그", "저", "것", "수", "등", "및", "를", "을", "에", "의", "가", "은", "는", "the", "a", "an", "of", "to", "in", "for"}
 
-      const reader = new FileReader();
-      reader.onload = function(e) {
-        const dataUrl = e.target.result;
-        const base64Content = dataUrl.split(',')[1];
-        AppState.fileName = file.name;
-        AppState.pdfBase64 = base64Content;
-        AppState.fileSizeBytes = file.size;
+    @classmethod
+    def tokenize(cls, text: str) -> List[str]:
+        if not text:
+            return []
+        raw_tokens = cls.TOKEN_PATTERN.findall(text.lower())
+        tokens: List[str] = []
+        for tok in raw_tokens:
+            if tok in cls.STOPWORDS:
+                continue
+            tokens.append(tok)
+            # 한국어 3글자 이상 어절은 접두 2글자/3글자 서브토큰을 추가하여 조사 분리 효과 확보
+            if len(tok) >= 3 and re.match(r"^[가-힣]+$", tok):
+                tokens.append(tok[:2])
+                if len(tok) >= 4:
+                    tokens.append(tok[:3])
+        return tokens if tokens else ["_empty_"]
 
-        document.getElementById('selectedFileName').textContent = file.name;
-        document.getElementById('selectedFileSize').textContent = `${(file.size / 1024).toFixed(1)} KB`;
-        updateProgressUI(15, `'${file.name}' 로드 완료. [벡터 DB 생성] 버튼을 클릭하세요.`, `[FILE] 로컬 PDF '${file.name}' (${(file.size / 1024).toFixed(1)} KB) 준비됨`);
-      };
-      reader.onerror = function() {
-        showError('LOCAL_FILE_READ', 'ERR_FILE_READER', '선택한 PDF 파일을 읽는 중 오류가 발생했습니다.');
-      };
-      reader.readAsDataURL(file);
-    }
 
-    /**
-     * 3. 벡터 DB 생성 요청 (StreamHandler 연동)
-     */
-    async function handleBuildVectorDB() {
-      clearError();
-      if (!AppState.pdfBase64) {
-        showError(
-          'BUILD_DB_PRECHECK',
-          'ERR_NO_PDF_LOADED',
-          '먼저 [파일 요청] 또는 [로컬 PDF 파일 선택] 버튼으로 PDF 파일을 불러와 주세요.'
-        );
-        return;
-      }
+class EmbeddingAndLLMEngine:
+    """
+    임베딩 생성 및 LLM 호출 엔진 (Gemini API 연동 + 결정론적 로컬 폴백 지원)
+    ------------------------------------------------------------------------
+    - GEMINI_API_KEY 환경 변수가 설정되어 있으면 Google Gemini 모델(`text-embedding-004`,
+      `gemini-2.5-flash`)을 호출합니다.
+    - API 키가 없거나 네트워크가 제한된 환경에서도 파이프라인 전체가 즉시 동작하도록
+      고차원 의미 해싱 임베딩(Semantic N-gram Random Projection, dim=384) 및
+      관점 기반 다중 쿼리 확장기를 내장하고 있습니다.
+    """
 
-      const indexType = document.getElementById('faissIndexType').value;
-      const chunkSize = parseInt(document.getElementById('chunkSizeInput').value, 10) || 500;
-      const btn = document.getElementById('btnBuildDb');
-      btn.disabled = true;
+    def __init__(self, embedding_dim: int = 384):
+        self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self.client = None
+        self.embedding_dim = embedding_dim
+        self.mode = "local_hybrid_fallback"
 
-      document.getElementById('ragStreamLogs').innerHTML = '';
-      updateProgressUI(10, '서버로 PDF 전송 및 하이브리드 인덱스 생성 요청 중...', `[START] '${AppState.fileName}' -> FAISS(${indexType}) + BM25 인덱싱 시작`);
+        if HAS_GENAI and self.api_key:
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+                self.embedding_dim = 768  # text-embedding-004 기본 차원
+                self.mode = "gemini_api"
+                logger.info("Gemini API 클라이언트 초기화 완료 (dim=%d)", self.embedding_dim)
+            except Exception as e:
+                logger.warning("Gemini 클라이언트 초기화 실패, 로컬 엔진으로 폴백합니다: %s", e)
 
-      if (AppState.isGasEnv) {
-        google.script.run
-          .withSuccessHandler((res) => {
-            btn.disabled = false;
-            processStreamEventsResponse(res, 'BUILD_DB');
-          })
-          .withFailureHandler((err) => {
-            btn.disabled = false;
-            showError('BUILD_DB_RPC', 'ERR_GAS_BUILD_DB', err.message || String(err));
-          })
-          .buildVectorDBOnServer({
-            fileName: AppState.fileName,
-            pdfBase64: AppState.pdfBase64,
-            indexType: indexType,
-            chunkSize: chunkSize,
-            chunkOverlap: 100
-          });
-      } else {
-        // 브라우저 직접 NDJSON 실시간 스트리밍 수신 (ReadableStream)
-        const baseUrl = document.getElementById('cloudRunUrlInput').value.trim().replace(/\/+$/, '');
-        try {
-          const response = await fetch(`${baseUrl}/build-db`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              file_name: AppState.fileName,
-              pdf_base64: AppState.pdfBase64,
-              index_type: indexType,
-              chunk_size: chunkSize,
-              chunk_overlap: 100,
-              stream: true
-            })
-          });
+    def embed_texts(self, texts: List[str]) -> np.ndarray:
+        """
+        문서/쿼리 리스트를 고정 차원 Dense Float32 정규화 벡터 행렬로 변환합니다.
+        - 출력 shape: (len(texts), self.embedding_dim), dtype: np.float32
+        - 시간 복잡도: O(N * L * d) (로컬 투영 시) 또는 O(N) API 호출
+        """
+        if not texts:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32)
 
-          await consumeBrowserNdjsonStream(response, 'BUILD_DB');
-          refreshServerStatus();
-        } catch (err) {
-          showError('NETWORK_BUILD_DB', 'ERR_FETCH_BUILD_DB', '벡터 DB 생성 중 서버 통신 오류가 발생했습니다.', String(err));
-        } finally {
-          btn.disabled = false;
-        }
-      }
-    }
+        if self.client is not None:
+            try:
+                response = self.client.models.embed_content(
+                    model="text-embedding-004",
+                    contents=texts,
+                )
+                vectors = [emb.values for emb in response.embeddings]
+                arr = np.array(vectors, dtype=np.float32)
+                # L2 정규화
+                norms = np.linalg.norm(arr, axis=1, keepdims=True)
+                norms[norms == 0] = 1.0
+                return arr / norms
+            except Exception as e:
+                logger.warning("Gemini 임베딩 API 호출 실패, 로컬 해싱 임베딩으로 대체: %s", e)
 
-    /**
-     * 4. 하이브리드 Multi-Query + RRF 질의 요청
-     */
-    async function handleQueryRAG() {
-      clearError();
-      const query = document.getElementById('userQueryInput').value.trim();
-      if (!query) {
-        showError('QUERY_PRECHECK', 'ERR_EMPTY_QUERY', '질의 입력창에 질문 내용을 입력해 주세요.');
-        return;
-      }
+        # 결정론적 다중-스케일 문자/단어 N-gram 해싱 임베딩 (L2 정규화 포함)
+        dim = self.embedding_dim
+        matrix = np.zeros((len(texts), dim), dtype=np.float32)
+        for row_idx, text in enumerate(texts):
+            tokens = KoreanEnglishTokenizer.tokenize(text)
+            # 단어 토큰 + 문자 바이그램/트라이그램 결합으로 의미적/형태적 유사도 반영
+            clean = re.sub(r"\s+", " ", text.lower().strip())
+            char_ngrams = [clean[i:i+2] for i in range(max(0, len(clean) - 1))] + [
+                clean[i:i+3] for i in range(max(0, len(clean) - 2))
+            ]
+            features = tokens * 2 + char_ngrams  # 단어 토큰에 가중치 2배 부여
+            if not features:
+                matrix[row_idx, 0] = 1.0
+                continue
+            for feat in features:
+                # 안정적인 해시 시드 계산
+                h = int.from_bytes(feat.encode("utf-8"), byteorder="little")
+                idx1 = h % dim
+                idx2 = ((h >> 11) ^ 0x5DEECE66D) % dim
+                sign1 = 1.0 if (h & 1) == 0 else -1.0
+                sign2 = 1.0 if ((h >> 1) & 1) == 0 else -1.0
+                matrix[row_idx, idx1] += sign1
+                matrix[row_idx, idx2] += 0.5 * sign2
 
-      const topK = parseInt(document.getElementById('topKInput').value, 10) || 5;
-      const rrfK = parseInt(document.getElementById('rrfKInput').value, 10) || 60;
-      const denseWeight = parseFloat(document.getElementById('denseWeightInput').value) || 1.0;
-      const sparseWeight = parseFloat(document.getElementById('sparseWeightInput').value) || 1.0;
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return matrix / norms
 
-      const btn = document.getElementById('btnQueryRag');
-      btn.disabled = true;
-      updateProgressUI(15, '5가지 다중 쿼리 확장 및 FAISS + BM25 하이브리드 검색 진행 중...', `[QUERY] "${query}"`);
+    def expand_multi_queries(self, original_query: str) -> List[Dict[str, str]]:
+        """
+        [다중 쿼리 확장 계층 - Multi-Query Layer]
+        사용자의 단일 입력 쿼리를 서로 다른 5가지 관점의 파생 쿼리로 확장합니다.
+        관점:
+          1. 개념 및 정의 관점 (Conceptual & Definition)
+          2. 핵심 원리 및 메커니즘 관점 (Mechanism & Architecture)
+          3. 실무 적용 및 활용 사례 관점 (Practical Application & Use-cases)
+          4. 비교 분석 및 장단점 관점 (Comparison & Trade-offs)
+          5. 핵심 키워드 밀집 검색 관점 (Keyword-Dense Lexical Focus)
+        """
+        q = original_query.strip()
+        if self.client is not None:
+            try:
+                prompt = (
+                    "당신은 RAG 검색 최적화 전문가입니다. 아래 사용자 질의를 바탕으로 벡터 및 키워드 검색 재현율(Recall)을 "
+                    "극대화할 수 있도록 서로 다른 5가지 관점의 검색 쿼리로 확장하세요.\n"
+                    "반드시 JSON 배열 형식으로만 응답하세요: "
+                    '[{"id": 1, "perspective": "관점명", "query": "확장된 쿼리"}, ...]\n\n'
+                    f"사용자 질의: {q}"
+                )
+                resp = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                raw = resp.text.strip()
+                match = re.search(r"\[.*\]", raw, re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group(0))
+                    if isinstance(parsed, list) and len(parsed) >= 5:
+                        return [
+                            {
+                                "id": i + 1,
+                                "perspective": str(item.get("perspective", f"관점 {i+1}")),
+                                "query": str(item.get("query", q)),
+                            }
+                            for i, item in enumerate(parsed[:5])
+                        ]
+            except Exception as e:
+                logger.warning("LLM 다중 쿼리 생성 실패, 규칙 기반 5대 관점 확장기로 폴백: %s", e)
 
-      if (AppState.isGasEnv) {
-        google.script.run
-          .withSuccessHandler((res) => {
-            btn.disabled = false;
-            processStreamEventsResponse(res, 'QUERY');
-          })
-          .withFailureHandler((err) => {
-            btn.disabled = false;
-            showError('QUERY_RPC', 'ERR_GAS_QUERY', err.message || String(err));
-          })
-          .queryHybridRAGOnServer({
-            query,
-            topK,
-            rrfK,
-            denseWeight,
-            sparseWeight
-          });
-      } else {
-        const baseUrl = document.getElementById('cloudRunUrlInput').value.trim().replace(/\/+$/, '');
-        try {
-          const response = await fetch(`${baseUrl}/query`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              query,
-              top_k: topK,
-              rrf_k: rrfK,
-              dense_weight: denseWeight,
-              sparse_weight: sparseWeight,
-              stream: true
-            })
-          });
-          await consumeBrowserNdjsonStream(response, 'QUERY');
-        } catch (err) {
-          showError('NETWORK_QUERY', 'ERR_FETCH_QUERY', '질의 요청 중 서버 통신 오류가 발생했습니다.', String(err));
-        } finally {
-          btn.disabled = false;
-        }
-      }
-    }
+        # 핵심 키워드 추출
+        core_tokens = KoreanEnglishTokenizer.tokenize(q)
+        unique_keywords = []
+        for t in core_tokens:
+            if t not in unique_keywords and len(t) >= 2:
+                unique_keywords.append(t)
+        kw_str = " ".join(unique_keywords[:8]) if unique_keywords else q
 
-    /** GAS StreamHandler 응답 처리 */
-    function processStreamEventsResponse(res, mode) {
-      if (!res) return;
-      if (res.events && Array.isArray(res.events)) {
-        res.events.forEach((evt) => handleSingleStreamEvent(evt, mode));
-      }
-      if (res.status === 'error' && res.error) {
-        showError(res.error.stage || mode, res.error.error_code || 'ERR_SERVER', res.error.message, res.error.detail);
-        return;
-      }
-      if (res.complexity) {
-        updateComplexityUI(res.complexity);
-      }
-      if (mode === 'BUILD_DB') {
-        refreshServerStatus();
-      } else if (mode === 'QUERY' && res.data) {
-        renderQueryResult(res.data);
-      }
-    }
+        return [
+            {
+                "id": 1,
+                "perspective": "1. 개념 및 핵심 정의 관점",
+                "query": f"{q} 핵심 개념 정의 및 기본 개요 설명 ({kw_str})",
+            },
+            {
+                "id": 2,
+                "perspective": "2. 작동 원리 및 구조적 메커니즘 관점",
+                "query": f"{q} 세부 작동 원리 프로세스 아키텍처 구성 요소 ({kw_str})",
+            },
+            {
+                "id": 3,
+                "perspective": "3. 실무 적용 방법 및 구체적 사례 관점",
+                "query": f"{q} 실제 적용 방법 구현 절차 및 활용 사례 ({kw_str})",
+            },
+            {
+                "id": 4,
+                "perspective": "4. 성능 특성·장단점 및 비교 분석 관점",
+                "query": f"{q} 주요 장점 한계점 성능 비교 및 고려사항 ({kw_str})",
+            },
+            {
+                "id": 5,
+                "perspective": "5. 핵심 키워드 밀집 매칭 관점 (BM25 최적화)",
+                "query": f"{kw_str} {q}",
+            },
+        ]
 
-    /** 로컬 브라우저 ReadableStream 기반 실시간 NDJSON 스트림 파서 */
-    async function consumeBrowserNdjsonStream(response, mode) {
-      if (!response.ok) {
-        const errText = await response.text();
-        showError(`HTTP_${response.status}`, 'ERR_HTTP_STATUS', `서버가 HTTP ${response.status} 응답을 반환했습니다.`, errText);
-        return;
-      }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      let buffer = '';
+    def synthesize_answer(
+        self,
+        query: str,
+        expanded_queries: List[Dict[str, str]],
+        ranked_docs: List[Dict[str, Any]],
+    ) -> str:
+        """
+        RRF로 재정렬된 상위 문서 스니펫들을 근거로 최종 답변을 생성하며,
+        모든 핵심 문장에 [출처: 파일명 p.페이지, Chunk #번호] 형태의 출처를 명시합니다.
+        """
+        if not ranked_docs:
+            return "검색된 관련 문서가 없습니다. 먼저 PDF 파일을 업로드하여 벡터 DB를 생성해 주세요."
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const evt = JSON.parse(line);
-          handleSingleStreamEvent(evt, mode);
-        }
-      }
-      if (buffer.trim()) {
-        const evt = JSON.parse(buffer.trim());
-        handleSingleStreamEvent(evt, mode);
-      }
-    }
+        if self.client is not None:
+            try:
+                context_blocks = []
+                for idx, doc in enumerate(ranked_docs, start=1):
+                    citation = f"[출처: {doc['file_name']} p.{doc['page_number']}, Chunk #{doc['chunk_index']}]"
+                    context_blocks.append(
+                        f"문서 [{idx}] {citation} (RRF 점수: {doc['rrf_score']:.5f}):\n{doc['content']}"
+                    )
+                context_text = "\n\n".join(context_blocks)
+                prompt = (
+                    "당신은 신뢰할 수 있는 엔터프라이즈 RAG AI 어시스턴트입니다.\n"
+                    "제공된 [검색 문서 컨텍스트]만을 근거로 사용자의 질문에 체계적이고 명확하게 한국어로 답변하세요.\n"
+                    "답변 작성 규칙:\n"
+                    "1. 핵심 요약, 상세 분석, 결론 순서로 구조화하여 작성할 것.\n"
+                    "2. 인용한 모든 내용 뒤에는 반드시 `[출처: 파일명 p.페이지, Chunk #청크번호]` 형식으로 출처를 표기할 것.\n"
+                    "3. 컨텍스트에 없는 내용은 추측하지 말고 문서에서 확인된 사실만 기술할 것.\n\n"
+                    f"[사용자 질문]\n{query}\n\n"
+                    f"[검색 문서 컨텍스트]\n{context_text}"
+                )
+                resp = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                if resp.text:
+                    return resp.text.strip()
+            except Exception as e:
+                logger.warning("Gemini 답변 생성 실패, 구조적 근거 요약 합성기로 대체: %s", e)
 
-    /** 단일 StreamHandler 이벤트 프레임 처리 */
-    function handleSingleStreamEvent(evt, mode) {
-      if (evt.complexity) {
-        updateComplexityUI(evt.complexity);
-      }
-      if (evt.event === 'error') {
-        const err = evt.error || {};
-        updateProgressUI(0, `오류 중단: ${err.message || evt.message}`, `[ERROR] (${err.error_code}) ${err.message}`);
-        showError(err.stage || evt.stage || mode, err.error_code || 'ERR_STREAM', err.message || evt.message, err.detail);
-        return;
-      }
+        # 로컬 구조적 근거 합성 (항상 출처 표기 포함)
+        lines = [
+            f"### 질문에 대한 Hybrid RAG Fusion 종합 답변",
+            f"**질의 내용**: \"{query}\"",
+            f"**적용 파이프라인**: 5가지 다중 쿼리 확장 → FAISS Dense + BM25 Sparse 하이브리드 검색 → RRF 순위 융합 (상위 {len(ranked_docs)}개 문서 선별)\n",
+            "---",
+            "#### 1. 핵심 근거 요약 및 분석",
+        ]
+        for rank_idx, doc in enumerate(ranked_docs, start=1):
+            citation = f"[출처: {doc['file_name']} p.{doc['page_number']}, Chunk #{doc['chunk_index']}]"
+            snippet = doc["content"].strip()
+            lines.append(
+                f"**({rank_idx}) 핵심 근거 #{rank_idx}** — RRF 점수 `{doc['rrf_score']:.5f}` "
+                f"(FAISS 최고순위: `{doc['best_dense_rank'] or '-'}`, BM25 최고순위: `{doc['best_sparse_rank'] or '-'}`)\n"
+                f"> {snippet}\n"
+                f"- **근거 출처**: {citation}\n"
+            )
 
-      updateProgressUI(evt.progress || 0, evt.message, `[${evt.stage}] ${evt.message}`);
-
-      if (mode === 'QUERY') {
-        if (evt.event === 'partial_result' && evt.data) {
-          if (evt.data.expanded_queries) renderMultiQueries(evt.data.expanded_queries);
-          if (evt.data.ranked_documents) renderRankedDocuments(evt.data.ranked_documents);
-        } else if (evt.event === 'complete' && evt.data) {
-          renderQueryResult(evt.data);
-        }
-      }
-    }
-
-    /** 5가지 확장된 다중 쿼리 렌더링 */
-    function renderMultiQueries(queries) {
-      const container = document.getElementById('multiQueryContainer');
-      if (!queries || !queries.length) return;
-      container.innerHTML = queries
-        .map(
-          (q) => `
-          <div class="mq-item">
-            <span class="mq-perspective">${escapeHtml(q.perspective)}</span>
-            <div>${escapeHtml(q.query)}</div>
-          </div>`
+        citations_summary = ", ".join(
+            f"[출처: {d['file_name']} p.{d['page_number']}, Chunk #{d['chunk_index']}]"
+            for d in ranked_docs
         )
-        .join('');
-    }
+        lines.extend([
+            "---",
+            "#### 2. 종합 결론",
+            f"위 상위 {len(ranked_docs)}개 핵심 문맥을 종합하면, **\"{query}\"**에 대한 주요 내용은 "
+            f"{ranked_docs[0]['file_name']} 문서의 {ranked_docs[0]['page_number']}페이지 등을 중심으로 확인됩니다. "
+            f"다중 관점 쿼리와 RRF 상호 순위 융합을 통해 의미적 유사성(FAISS)과 정확한 키워드 일치(BM25)가 모두 검증된 결과입니다. "
+            f"{citations_summary}",
+        ])
+        return "\n".join(lines)
 
-    /** RRF 순위 융합 상위 문서 스니펫 및 메타데이터 렌더링 */
-    function renderRankedDocuments(docs) {
-      const container = document.getElementById('ragDocumentsContainer');
-      if (!docs || !docs.length) {
-        container.innerHTML = '<div class="doc-card">검색된 문서가 없습니다.</div>';
-        return;
-      }
-      container.innerHTML = docs
-        .map(
-          (doc) => `
-          <div class="doc-card">
-            <div class="doc-card-header">
-              <div>
-                <span class="badge badge-rrf">RRF #${doc.final_rank} (점수: ${Number(doc.rrf_score).toFixed(5)})</span>
-                <span class="badge badge-faiss">FAISS 순위: ${doc.best_dense_rank ?? '-'} (유사도: ${doc.dense_similarity})</span>
-                <span class="badge badge-bm25">BM25 순위: ${doc.best_sparse_rank ?? '-'} (점수: ${doc.bm25_score})</span>
-              </div>
-              <span class="badge badge-source">${escapeHtml(doc.citation)}</span>
-            </div>
-            <div class="doc-snippet">${escapeHtml(doc.content)}</div>
-          </div>`
+
+# ==============================================================================
+# 4. FAISS + BM25 하이브리드 인덱스 및 RRF 파이프라인 매니저
+# ==============================================================================
+
+class HybridRAGPipeline:
+    """
+    FAISS(IndexFlatL2 / IndexHNSWFlat) + BM25 하이브리드 검색 및 RRF 융합 엔진
+    """
+
+    def __init__(self):
+        self.engine = EmbeddingAndLLMEngine(embedding_dim=384)
+        self.faiss_index: Optional[faiss.Index] = None
+        self.index_type: str = "IndexHNSWFlat"
+        self.bm25_index: Optional[BM25Okapi] = None
+        self.documents: List[DocumentChunk] = []
+        self.tokenized_corpus: List[List[str]] = []
+        self.active_file_name: Optional[str] = None
+        self.last_build_time: Optional[float] = None
+        self.build_metrics: Dict[str, Any] = {}
+
+    def is_ready(self) -> bool:
+        """인덱스가 정상 구축되어 검색 가능한지 확인"""
+        return (
+            self.faiss_index is not None
+            and self.bm25_index is not None
+            and len(self.documents) > 0
         )
-        .join('');
+
+    @staticmethod
+    def extract_pages_from_pdf_bytes(pdf_bytes: bytes) -> List[Tuple[int, str]]:
+        """
+        PDF 바이너리에서 페이지별 텍스트를 추출합니다.
+        - 시간 복잡도: O(P * C_p) (P: 페이지 수, C_p: 페이지당 문자 수)
+        """
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages: List[Tuple[int, str]] = []
+        for idx, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            cleaned = re.sub(r"[ \t]+", " ", text).strip()
+            if cleaned:
+                pages.append((idx, cleaned))
+        return pages
+
+    @staticmethod
+    def chunk_pages(
+        pages: List[Tuple[int, str]],
+        file_name: str,
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
+    ) -> List[DocumentChunk]:
+        """
+        페이지별 텍스트를 문장 경계를 고려한 슬라이딩 윈도우 방식으로 청킹합니다.
+        - 시간 복잡도: O(C) (C: 전체 문서 문자 수)
+        - 공간 복잡도: O(N * chunk_size) (N: 생성된 청크 수)
+        """
+        chunks: List[DocumentChunk] = []
+        doc_id = 0
+        step = max(50, chunk_size - chunk_overlap)
+
+        for page_num, text in pages:
+            start = 0
+            chunk_idx_in_page = 1
+            text_len = len(text)
+            while start < text_len:
+                end = min(text_len, start + chunk_size)
+                # 문장 마침표나 개행 근처에서 자연스럽게 자르기
+                if end < text_len:
+                    natural_break = max(
+                        text.rfind(". ", start + int(chunk_size * 0.6), end),
+                        text.rfind(".\n", start + int(chunk_size * 0.6), end),
+                        text.rfind("\n", start + int(chunk_size * 0.6), end),
+                    )
+                    if natural_break != -1 and natural_break > start:
+                        end = natural_break + 1
+
+                snippet = text[start:end].strip()
+                if snippet:
+                    tokens = KoreanEnglishTokenizer.tokenize(snippet)
+                    chunks.append(
+                        DocumentChunk(
+                            doc_id=doc_id,
+                            file_name=file_name,
+                            page_number=page_num,
+                            chunk_index=chunk_idx_in_page,
+                            content=snippet,
+                            token_count=len(tokens),
+                            char_count=len(snippet),
+                        )
+                    )
+                    doc_id += 1
+                    chunk_idx_in_page += 1
+
+                if end >= text_len:
+                    break
+                start = max(start + 1, end - chunk_overlap)
+
+        return chunks
+
+    def build_indices(
+        self,
+        chunks: List[DocumentChunk],
+        index_type: str = "IndexHNSWFlat",
+    ) -> Dict[str, Any]:
+        """
+        [FAISS Index 구축 및 BM25 코퍼스 인덱싱]
+        - IndexFlatL2: 전수 L2 거리 계산 (정확도 100%, 검색 복잡도 O(N * d))
+        - IndexHNSWFlat: 계층적 그래프 기반 근사 탐색 (M=32, efConstruction=64, efSearch=32, 검색 복잡도 O(d * log N))
+        """
+        if not chunks:
+            raise ValueError("인덱싱할 문서 청크가 비어 있습니다.")
+
+        t0 = time.perf_counter()
+        self.documents = chunks
+        self.active_file_name = chunks[0].file_name
+
+        # 1) Dense 임베딩 생성
+        texts = [c.content for c in chunks]
+        embeddings = self.engine.embed_texts(texts)
+        num_docs, dim = embeddings.shape
+
+        # 2) FAISS 인덱스 초기화 및 벡터 적재
+        normalized_type = "IndexFlatL2" if index_type == "IndexFlatL2" else "IndexHNSWFlat"
+        self.index_type = normalized_type
+
+        if normalized_type == "IndexFlatL2":
+            index = faiss.IndexFlatL2(dim)
+        else:
+            # IndexHNSWFlat(dim, M): M=32 연결 그래프 구성
+            index = faiss.IndexHNSWFlat(dim, 32)
+            index.hnsw.efConstruction = 64
+            index.hnsw.efSearch = 32
+
+        index.add(embeddings)
+        self.faiss_index = index
+
+        # 3) Sparse BM25 인덱스 구축
+        self.tokenized_corpus = [KoreanEnglishTokenizer.tokenize(c.content) for c in chunks]
+        self.bm25_index = BM25Okapi(self.tokenized_corpus)
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        self.last_build_time = time.time()
+
+        complexity_info = {
+            "chunking": "Time: O(C), Space: O(N * L)",
+            "faiss_build": (
+                f"Time: O(N * d) [N={num_docs}, d={dim}]"
+                if normalized_type == "IndexFlatL2"
+                else f"Time: O(N * d * log N) [N={num_docs}, d={dim}, M=32]"
+            ),
+            "faiss_search_per_query": (
+                f"O(N * d) ({ normalized_type })"
+                if normalized_type == "IndexFlatL2"
+                else f"O(d * log N) ({ normalized_type })"
+            ),
+            "bm25_build": f"Time: O(N * L_avg) [N={num_docs}]",
+            "space_complexity": f"O(N * d + N * L_avg) ≈ {num_docs * dim * 4 / 1024:.1f} KB (Vectors)",
+        }
+
+        self.build_metrics = {
+            "file_name": self.active_file_name,
+            "total_chunks": num_docs,
+            "embedding_dim": dim,
+            "index_type": normalized_type,
+            "engine_mode": self.engine.mode,
+            "build_elapsed_ms": elapsed_ms,
+            "complexity": complexity_info,
+        }
+        return self.build_metrics
+
+    def search_hybrid_rrf(
+        self,
+        query: str,
+        top_k: int = 5,
+        rrf_k: int = 60,
+        dense_weight: float = 1.0,
+        sparse_weight: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        [Multi-Query (5개 확장) + Hybrid Search (FAISS + BM25) + RRF Fusion 파이프라인]
+        ------------------------------------------------------------------------
+        1. 단일 사용자 쿼리를 5가지 관점의 파생 쿼리로 확장합니다.
+        2. 각 확장 쿼리마다:
+           - FAISS Dense 검색으로 상위 K_cand개 문서와 L2 거리(및 유사도)를 산출합니다.
+           - BM25 Sparse 검색으로 상위 K_cand개 문서와 BM25 점수를 산출합니다.
+        3. Reciprocal Rank Fusion (RRF) 공식 적용:
+           RRF_Score(d) = Σ_{q_i} [ w_dense / (rrf_k + rank_dense(d, q_i))
+                                  + w_sparse / (rrf_k + rank_sparse(d, q_i)) ]
+        4. 최종 상위 top_k개 문서를 재정렬하여 반환하고 LLM 답변을 합성합니다.
+        """
+        if not self.is_ready():
+            raise RuntimeError("벡터 DB가 아직 초기화되지 않았습니다. 먼저 PDF로 벡터 DB를 생성해 주세요.")
+
+        t_start = time.perf_counter()
+        num_docs = len(self.documents)
+        candidate_k = min(num_docs, max(top_k * 3, 10))
+
+        # Step 1: 5가지 관점의 다중 쿼리 확장
+        t_mq = time.perf_counter()
+        expanded_queries = self.engine.expand_multi_queries(query)
+        mq_elapsed_ms = round((time.perf_counter() - t_mq) * 1000, 2)
+
+        # Step 2: 확장된 5개 쿼리에 대한 FAISS Dense + BM25 Sparse 하이브리드 검색
+        t_search = time.perf_counter()
+        query_strings = [item["query"] for item in expanded_queries]
+        query_embeddings = self.engine.embed_texts(query_strings)
+
+        # FAISS 일괄 검색: distances shape=(M, candidate_k), indices shape=(M, candidate_k)
+        distances, faiss_indices = self.faiss_index.search(query_embeddings, candidate_k)
+
+        # RRF 누적 테이블
+        rrf_scores: Dict[int, float] = {}
+        doc_trace: Dict[int, Dict[str, Any]] = {}
+        per_query_search_logs: List[Dict[str, Any]] = []
+
+        for q_idx, q_info in enumerate(expanded_queries):
+            q_str = q_info["query"]
+            # (a) FAISS Dense 순위 반영
+            dense_hits: List[Dict[str, Any]] = []
+            for rank_0, (doc_id_raw, dist_raw) in enumerate(zip(faiss_indices[q_idx], distances[q_idx])):
+                doc_id = int(doc_id_raw)
+                if doc_id < 0 or doc_id >= num_docs:
+                    continue
+                rank = rank_0 + 1
+                dist = float(dist_raw)
+                # 정규화 벡터 기준 L2 거리를 코사인 유사도 근사치(0~1)로 변환: sim = max(0, 1 - dist / 2)
+                dense_sim = max(0.0, 1.0 - (dist / 2.0))
+                rrf_contrib = dense_weight * (1.0 / (rrf_k + rank))
+                rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + rrf_contrib
+
+                trace = doc_trace.setdefault(
+                    doc_id,
+                    {
+                        "dense_ranks": [],
+                        "sparse_ranks": [],
+                        "max_dense_sim": 0.0,
+                        "max_bm25_score": 0.0,
+                        "matched_perspectives": set(),
+                    },
+                )
+                trace["dense_ranks"].append(rank)
+                trace["max_dense_sim"] = max(trace["max_dense_sim"], dense_sim)
+                trace["matched_perspectives"].add(q_info["perspective"])
+                dense_hits.append({"doc_id": doc_id, "rank": rank, "similarity": round(dense_sim, 4)})
+
+            # (b) BM25 Sparse 키워드 순위 반영
+            q_tokens = KoreanEnglishTokenizer.tokenize(q_str)
+            bm25_scores = self.bm25_index.get_scores(q_tokens)
+            top_bm25_indices = np.argsort(bm25_scores)[::-1][:candidate_k]
+
+            sparse_hits: List[Dict[str, Any]] = []
+            for rank_0, doc_id_raw in enumerate(top_bm25_indices):
+                doc_id = int(doc_id_raw)
+                score = float(bm25_scores[doc_id])
+                rank = rank_0 + 1
+                # 점수가 0보다 큰 경우에만 키워드 매칭 가중치 부여 (전혀 매칭 안 된 문서의 노이즈 방지)
+                if score > 0.0:
+                    rrf_contrib = sparse_weight * (1.0 / (rrf_k + rank))
+                    rrf_scores[doc_id] = rrf_scores.get(doc_id, 0.0) + rrf_contrib
+
+                    trace = doc_trace.setdefault(
+                        doc_id,
+                        {
+                            "dense_ranks": [],
+                            "sparse_ranks": [],
+                            "max_dense_sim": 0.0,
+                            "max_bm25_score": 0.0,
+                            "matched_perspectives": set(),
+                        },
+                    )
+                    trace["sparse_ranks"].append(rank)
+                    trace["max_bm25_score"] = max(trace["max_bm25_score"], score)
+                    trace["matched_perspectives"].add(q_info["perspective"])
+                    sparse_hits.append({"doc_id": doc_id, "rank": rank, "bm25_score": round(score, 4)})
+
+            per_query_search_logs.append(
+                {
+                    "id": q_info["id"],
+                    "perspective": q_info["perspective"],
+                    "expanded_query": q_str,
+                    "dense_top3": dense_hits[:3],
+                    "sparse_top3": sparse_hits[:3],
+                }
+            )
+
+        hybrid_search_elapsed_ms = round((time.perf_counter() - t_search) * 1000, 2)
+
+        # Step 3: RRF 점수 기준 내림차순 정렬 (Re-ranking)
+        t_rrf = time.perf_counter()
+        sorted_doc_ids = sorted(rrf_scores.keys(), key=lambda d_id: rrf_scores[d_id], reverse=True)[:top_k]
+
+        ranked_results: List[Dict[str, Any]] = []
+        for final_rank, doc_id in enumerate(sorted_doc_ids, start=1):
+            chunk = self.documents[doc_id]
+            trace = doc_trace[doc_id]
+            ranked_results.append(
+                {
+                    "final_rank": final_rank,
+                    "doc_id": chunk.doc_id,
+                    "file_name": chunk.file_name,
+                    "page_number": chunk.page_number,
+                    "chunk_index": chunk.chunk_index,
+                    "content": chunk.content,
+                    "rrf_score": round(rrf_scores[doc_id], 6),
+                    "best_dense_rank": min(trace["dense_ranks"]) if trace["dense_ranks"] else None,
+                    "best_sparse_rank": min(trace["sparse_ranks"]) if trace["sparse_ranks"] else None,
+                    "dense_similarity": round(trace["max_dense_sim"], 4),
+                    "bm25_score": round(trace["max_bm25_score"], 4),
+                    "matched_perspectives": sorted(list(trace["matched_perspectives"])),
+                    "citation": f"[출처: {chunk.file_name} p.{chunk.page_number}, Chunk #{chunk.chunk_index}]",
+                }
+            )
+        rrf_elapsed_ms = round((time.perf_counter() - t_rrf) * 1000, 2)
+
+        # Step 4: LLM 최종 답변 합성
+        t_llm = time.perf_counter()
+        answer = self.engine.synthesize_answer(query, expanded_queries, ranked_results)
+        llm_elapsed_ms = round((time.perf_counter() - t_llm) * 1000, 2)
+        total_elapsed_ms = round((time.perf_counter() - t_start) * 1000, 2)
+
+        M = len(expanded_queries)
+        U = len(rrf_scores)
+        complexity_metrics = {
+            "multi_query_expansion": f"O(M) [M={M} perspectives]",
+            "faiss_dense_search": (
+                f"O(M * N * d) [IndexFlatL2, M={M}, N={num_docs}, d={self.engine.embedding_dim}]"
+                if self.index_type == "IndexFlatL2"
+                else f"O(M * d * log N) [IndexHNSWFlat, M={M}, N={num_docs}, d={self.engine.embedding_dim}]"
+            ),
+            "bm25_sparse_search": f"O(M * |Q| * N) [M={M}, N={num_docs}]",
+            "rrf_fusion_rerank": f"O(M * K_cand + U * log U) [K_cand={candidate_k}, U={U} unique docs]",
+            "space_complexity": f"O(N * d + U) [N={num_docs}, U={U}]",
+        }
+
+        return {
+            "status": "success",
+            "original_query": query,
+            "expanded_queries": expanded_queries,
+            "per_query_search_logs": per_query_search_logs,
+            "ranked_documents": ranked_results,
+            "llm_answer": answer,
+            "sources": [
+                {
+                    "rank": r["final_rank"],
+                    "file_name": r["file_name"],
+                    "page_number": r["page_number"],
+                    "chunk_index": r["chunk_index"],
+                    "citation": r["citation"],
+                    "rrf_score": r["rrf_score"],
+                }
+                for r in ranked_results
+            ],
+            "metrics": {
+                "index_type": self.index_type,
+                "total_indexed_chunks": num_docs,
+                "rrf_k": rrf_k,
+                "dense_weight": dense_weight,
+                "sparse_weight": sparse_weight,
+                "timings_ms": {
+                    "multi_query_ms": mq_elapsed_ms,
+                    "hybrid_search_ms": hybrid_search_elapsed_ms,
+                    "rrf_fusion_ms": rrf_elapsed_ms,
+                    "llm_synthesis_ms": llm_elapsed_ms,
+                    "total_ms": total_elapsed_ms,
+                },
+                "complexity": complexity_metrics,
+            },
+        }
+
+
+# ==============================================================================
+# 5. FastAPI 애플리케이션 및 엔드포인트 정의
+# ==============================================================================
+
+app = FastAPI(
+    title="Advanced Hybrid RAG Fusion Server",
+    description="FAISS + BM25 Hybrid Search, 5-Way Multi-Query Expansion, and RRF Re-ranking Backend for GAS",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+pipeline = HybridRAGPipeline()
+
+
+@app.get("/health")
+async def health_check():
+    """
+    서버 연동 상태 및 현재 로드된 FAISS/BM25 인덱스 메타데이터 반환
+    """
+    return {
+        "status": "online",
+        "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "db_ready": pipeline.is_ready(),
+        "active_file_name": pipeline.active_file_name,
+        "total_chunks": len(pipeline.documents),
+        "index_type": pipeline.index_type,
+        "embedding_dim": pipeline.engine.embedding_dim,
+        "engine_mode": pipeline.engine.mode,
+        "build_metrics": pipeline.build_metrics,
     }
 
-    /** 전체 질의 결과(RAG 스니펫 + LLM 답변 + 출처 목록 + 타이밍 메트릭) 렌더링 */
-    function renderQueryResult(result) {
-      if (result.expanded_queries) renderMultiQueries(result.expanded_queries);
-      if (result.ranked_documents) renderRankedDocuments(result.ranked_documents);
 
-      // 타이밍 및 복잡도 배지 업데이트
-      if (result.metrics) {
-        if (result.metrics.complexity) updateComplexityUI(result.metrics.complexity);
-        const t = result.metrics.timings_ms || {};
-        document.getElementById('searchTimingBadge').textContent =
-          `Multi-Query: ${t.multi_query_ms || 0}ms | Hybrid+RRF: ${(t.hybrid_search_ms || 0) + (t.rrf_fusion_ms || 0)}ms`;
-        document.getElementById('llmTimingBadge').textContent =
-          `LLM 합성: ${t.llm_synthesis_ms || 0}ms (총 ${t.total_ms || 0}ms)`;
-      }
+@app.post("/build-db")
+async def build_vector_db(req: BuildDBRequest):
+    """
+    PDF 파일(Base64) 또는 원문 텍스트를 받아 청킹 후 FAISS + BM25 하이브리드 인덱스를 구축합니다.
+    `req.stream == True`이면 StreamHandler를 통해 실시간 진행 단계를 NDJSON 스트림으로 반환합니다.
+    """
 
-      // LLM 답변 렌더링 ([출처: ...] 패턴을 시각적 배지로 강조)
-      const rawAnswer = result.llm_answer || '';
-      const safeAnswer = escapeHtml(rawAnswer).replace(
-        /\[출처:[^\]]+\]/g,
-        (match) => `<span class="citation-pill">${match}</span>`
-      );
-      document.getElementById('llmAnswerContainer').innerHTML = safeAnswer;
+    async def stream_generator() -> AsyncGenerator[str, None]:
+        try:
+            yield StreamHandler.format_event(
+                event_type="progress",
+                stage="INIT",
+                progress=10,
+                message=f"'{req.file_name}' 파일 수신 완료. PDF 텍스트 추출을 시작합니다.",
+                complexity={"pdf_parsing": "Time: O(P * C_p)"},
+            )
 
-      // 하단 출처 목록 렌더링
-      const sourcesContainer = document.getElementById('citationListContainer');
-      const sources = result.sources || [];
-      if (sources.length > 0) {
-        sourcesContainer.innerHTML = sources
-          .map(
-            (s) =>
-              `<span class="citation-pill" title="RRF Score: ${s.rrf_score}">${escapeHtml(s.citation)} (RRF: ${Number(s.rrf_score).toFixed(4)})</span>`
-          )
-          .join('');
-      }
+            pages: List[Tuple[int, str]] = []
+            if req.pdf_base64:
+                try:
+                    raw_b64 = req.pdf_base64.split(",")[-1].strip()
+                    pdf_bytes = base64.b64decode(raw_b64)
+                    pages = pipeline.extract_pages_from_pdf_bytes(pdf_bytes)
+                except Exception as pdf_err:
+                    yield StreamHandler.format_error(
+                        stage="PDF_EXTRACTION",
+                        error_code="ERR_PDF_DECODE_OR_PARSE",
+                        message="PDF 파일 디코딩 또는 텍스트 추출 중 오류가 발생했습니다.",
+                        detail=str(pdf_err),
+                    )
+                    return
+            elif req.raw_text:
+                pages = [(1, req.raw_text.strip())]
+            else:
+                yield StreamHandler.format_error(
+                    stage="INIT",
+                    error_code="ERR_EMPTY_PAYLOAD",
+                    message="PDF 데이터(pdf_base64) 또는 텍스트(raw_text)가 제공되지 않았습니다.",
+                )
+                return
+
+            if not pages:
+                yield StreamHandler.format_error(
+                    stage="PDF_EXTRACTION",
+                    error_code="ERR_NO_EXTRACTABLE_TEXT",
+                    message="PDF에서 추출 가능한 텍스트가 없습니다. (스캔 이미지 PDF인지 확인하세요)",
+                )
+                return
+
+            yield StreamHandler.format_event(
+                event_type="progress",
+                stage="CHUNKING",
+                progress=40,
+                message=f"총 {len(pages)}페이지 텍스트 추출 완료. 슬라이딩 윈도우 청킹(size={req.chunk_size}, overlap={req.chunk_overlap}) 진행 중...",
+                complexity={"chunking": "Time: O(C), Space: O(N * L)"},
+            )
+
+            chunks = pipeline.chunk_pages(
+                pages=pages,
+                file_name=req.file_name,
+                chunk_size=req.chunk_size,
+                chunk_overlap=req.chunk_overlap,
+            )
+
+            yield StreamHandler.format_event(
+                event_type="progress",
+                stage="INDEXING",
+                progress=75,
+                message=f"총 {len(chunks)}개 청크 생성 완료. FAISS({req.index_type}) 벡터 인덱스 및 BM25 키워드 인덱스 구축 중...",
+            )
+
+            metrics = pipeline.build_indices(chunks=chunks, index_type=req.index_type)
+
+            yield StreamHandler.format_event(
+                event_type="complete",
+                stage="DONE",
+                progress=100,
+                message=f"하이브리드 벡터 DB 구축 완료! (총 {len(chunks)}개 청크, 인덱스: {metrics['index_type']})",
+                data=metrics,
+                complexity=metrics["complexity"],
+            )
+        except Exception as e:
+            logger.error("벡터 DB 구축 실패: %s\n%s", e, traceback.format_exc())
+            yield StreamHandler.format_error(
+                stage="INDEXING",
+                error_code="ERR_BUILD_INDEX_FAILED",
+                message="FAISS / BM25 인덱스 구축 중 서버 내부 오류가 발생했습니다.",
+                detail=str(e),
+            )
+
+    if req.stream:
+        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+
+    # 일반 JSON 응답 모드 (스트리밍 이벤트를 모두 수집하여 진행 로그와 함께 반환)
+    steps_log = []
+    final_data = None
+    error_obj = None
+    async for line in stream_generator():
+        evt = json.loads(line)
+        steps_log.append(evt)
+        if evt.get("event") == "error":
+            error_obj = evt.get("error")
+        elif evt.get("event") == "complete":
+            final_data = evt.get("data")
+
+    if error_obj:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": error_obj, "progress_logs": steps_log},
+        )
+
+    return {
+        "status": "success",
+        "message": f"'{req.file_name}' 기반 하이브리드 벡터 DB 생성이 완료되었습니다.",
+        "metrics": final_data,
+        "progress_logs": steps_log,
     }
 
-    function escapeHtml(str) {
-      if (str === null || str === undefined) return '';
-      return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#039;');
-    }
 
-    // 페이지 로드 시 서버 연동 상태 자동 점검
-    window.addEventListener('DOMContentLoaded', () => {
-      refreshServerStatus();
-    });
-  </script>
-</body>
-</html>
+@app.post("/query")
+async def query_rag_pipeline(req: QueryRequest):
+    """
+    단일 질의를 받아 5가지 다중 쿼리 확장 -> FAISS + BM25 하이브리드 검색 -> RRF 재정렬 -> LLM 답변 및 출처를 반환합니다.
+    `req.stream == True`이면 StreamHandler의 NDJSON 스트리밍으로 단계별 결과를 실시간 전송합니다.
+    """
+
+    async def query_stream_generator() -> AsyncGenerator[str, None]:
+        try:
+            if not pipeline.is_ready():
+                yield StreamHandler.format_error(
+                    stage="PRECHECK",
+                    error_code="ERR_DB_NOT_INITIALIZED",
+                    message="벡터 DB가 생성되지 않았습니다. 먼저 PDF 파일을 선택하고 '벡터 DB 생성' 버튼을 눌러주세요.",
+                )
+                return
+
+            yield StreamHandler.format_event(
+                event_type="progress",
+                stage="MULTI_QUERY",
+                progress=20,
+                message="단일 질의를 5가지 다각도 관점의 파생 쿼리로 확장 중...",
+                complexity={"multi_query": "Time: O(M) [M=5]"},
+            )
+
+            result = pipeline.search_hybrid_rrf(
+                query=req.query,
+                top_k=req.top_k,
+                rrf_k=req.rrf_k,
+                dense_weight=req.dense_weight,
+                sparse_weight=req.sparse_weight,
+            )
+
+            yield StreamHandler.format_event(
+                event_type="partial_result",
+                stage="HYBRID_RRF",
+                progress=65,
+                message=f"FAISS({pipeline.index_type}) + BM25 하이브리드 검색 및 RRF(k={req.rrf_k}) 상위 {len(result['ranked_documents'])}건 재정렬 완료.",
+                data={
+                    "expanded_queries": result["expanded_queries"],
+                    "ranked_documents": result["ranked_documents"],
+                },
+                complexity=result["metrics"]["complexity"],
+            )
+
+            yield StreamHandler.format_event(
+                event_type="complete",
+                stage="LLM_SYNTHESIS",
+                progress=100,
+                message="RRF 상위 문서 기반 LLM 답변 생성 및 출처 매핑 완료.",
+                data=result,
+                complexity=result["metrics"]["complexity"],
+            )
+        except Exception as e:
+            logger.error("질의 처리 중 오류 발생: %s\n%s", e, traceback.format_exc())
+            yield StreamHandler.format_error(
+                stage="QUERY_EXECUTION",
+                error_code="ERR_QUERY_PIPELINE_FAILED",
+                message="하이브리드 검색 및 RRF 융합 파이프라인 실행 중 오류가 발생했습니다.",
+                detail=str(e),
+            )
+
+    if req.stream:
+        return StreamingResponse(query_stream_generator(), media_type="application/x-ndjson")
+
+    steps_log = []
+    final_result = None
+    error_obj = None
+    async for line in query_stream_generator():
+        evt = json.loads(line)
+        steps_log.append(evt)
+        if evt.get("event") == "error":
+            error_obj = evt.get("error")
+        elif evt.get("event") == "complete":
+            final_result = evt.get("data")
+
+    if error_obj:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": error_obj, "stream_logs": steps_log},
+        )
+
+    final_result["stream_logs"] = steps_log
+    return final_result
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
 
